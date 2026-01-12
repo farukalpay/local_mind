@@ -268,22 +268,18 @@ std::string trim_trailing_noise(std::string text) {
         text.pop_back();
     }
 
-    // B. Hard Truncate to last punctuation
+    // B. Safe Truncate
+    // In "Stream of Consciousness" or "Visual Agnosia", sentences might be fragmented.
+    // If we find NO punctuation, we return the whole thing (better to have a dangling sentence than silent output).
     size_t last_punc = text.find_last_of(".!?\"");
     if (last_punc == std::string::npos) {
-        // No punctuation? Return as is (or panic fallback), but let's just return
         return text; 
     }
     
-    // If text continues meaningfully after last_punc, CUT IT (It's an unfinished sentence)
-    // E.g. "I ran home. The" -> "I ran home."
+    // If text continues significanly after last_punc, CUT IT (It's an unfinished sentence)
     if (last_punc < text.length() - 1) {
         text = text.substr(0, last_punc + 1);
     }
-
-    // C. (Removed aggressive pruning of short sentences like 'Run.' to prevent data loss)
-    // The previous logic defined <15 chars as 'suspicious' which killed punchy narrative.
-    // We trust the model more now.
 
     return text;
 }
@@ -640,16 +636,19 @@ std::string gemma_inject_chaos(MultiAgentState& state, const std::string& contex
     // Gemma'nın hafızasını temizle (her seferinde taze fikir)
     llama_memory_clear(llama_get_memory(state.ctx_scout), true);
 
-    std::cout << "\n[GEMMA-2B] Scanning Latent Space for Divergence..." << std::flush;
-
-    // Gemma'ya Özel Prompt (Matematiksel Görev)
+    std::cout << "\n[GEMMA-2B] Texture Engine: Synthesizing Sensory Vectors..." << std::flush;
+    
+    // TEXTURE ENGINE PROMPT (Visual Agnosia Mode)
+    // Goal: Prevent "Naming" (Noun) to stop "Explaining" (Causality).
+    // Strategy: Force Adjectives/Verbs only.
     std::string prompt = 
         "<start_of_turn>user\n"
         "Analyze this text segment: '" + context.substr(context.length() > 300 ? context.length() - 300 : 0) + "'\n"
-        "TASK: The story is stuck in a loop. I need a 'Plot Device' to break it.\n"
-        "INSTRUCTION: Provide ONE concrete, physical sci-fi object that contradicts the current scene.\n"
-        "CONSTRAINT: Do NOT use words: stone, rock, water, darkness.\n"
-        "OUTPUT FORMAT: Just the object name. (e.g. 'Humming Black Monolith')\n"
+        "TASK: The scene is too stable. I need DISSONANCE.\n"
+        "INSTRUCTION: Provide 3 concrete SENSORY VECTORS (Adjectives or Verbs) that contradict the scene.\n"
+        "CONSTRAINT: Do NOT name objects. Do NOT use Nouns. Do NOT explain.\n"
+        "EXAMPLES: 'Vibrating', 'Tasting Copper', 'Oozing', 'Screeching', 'Freezing'\n"
+        "OUTPUT FORMAT: Just the words, separated by comma.\n"
         "<end_of_turn><start_of_turn>model\n";
 
     // --- Gemma Generate (Minimal) ---
@@ -669,7 +668,7 @@ std::string gemma_inject_chaos(MultiAgentState& state, const std::string& contex
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(std::rand())); 
 
     std::string chaos_vector = "";
-    int max_tokens = 15;
+    int max_tokens = 20; // Slightly more for 3 words
     
     for (int i = 0; i < max_tokens; i++) {
         llama_token new_token_id = llama_sampler_sample(smpl, state.ctx_scout, -1);
@@ -738,6 +737,135 @@ std::string get_state_instruction(NarrativeState state) {
 // This is a simplified proxy for demonstration.
 
 
+// --- ACCORDION TOPOLOGY IMPLEMENTATION ---
+
+// [HELPER] Stateless Layer Generator
+std::string generate_layer(llama_context* ctx, llama_model* model, const std::string& prompt, int max_tokens, float temp, const std::vector<std::string>& stop_words) {
+    // Clear memory for stateless focus
+    llama_memory_clear(llama_get_memory(ctx), true); 
+    
+    auto* vocab = llama_model_get_vocab(model);
+    std::vector<llama_token> tokens_list(prompt.length() + 128); 
+    int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+    tokens_list.resize(n_tokens);
+
+    // Decode Prompt
+    llama_batch batch = llama_batch_get_one(tokens_list.data(), tokens_list.size());
+    if (llama_decode(ctx, batch) != 0) return "";
+
+    // Sampler Config
+    auto sparams = llama_sampler_chain_default_params();
+    struct llama_sampler * smpl = llama_sampler_chain_init(sparams);
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(std::rand()));
+    
+    std::string output = "";
+    
+    for(int i=0; i<max_tokens; i++) {
+        llama_token id = llama_sampler_sample(smpl, ctx, -1);
+        llama_sampler_accept(smpl, id);
+        
+        char buf[256];
+        int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+        if (n < 0) continue;
+        std::string piece(buf, n);
+        
+        // STOP WORD CHECK
+        bool stop = false;
+        for(const auto& s : stop_words) {
+            if (piece.find(s) != std::string::npos || output.find(s) != std::string::npos) {
+                stop = true; break;
+            }
+        }
+        if (stop || llama_vocab_is_eog(vocab, id)) break;
+
+        output += piece;
+        
+        if (llama_decode(ctx, llama_batch_get_one(&id, 1))) break;
+    }
+    
+    llama_sampler_free(smpl);
+    
+    // Trim
+    while(!output.empty() && isspace(output.front())) output.erase(0, 1);
+    while(!output.empty() && isspace(output.back())) output.pop_back();
+    
+    return output;
+}
+
+std::string generate_composite_narrative(MultiAgentState& state, const std::string& history) {
+    std::string composite_block = "";
+    
+    // --- PHASE 1: GEMMA (THE VOID) ---
+    std::cout << "\n[PHASE 1] Gemma constructing atmosphere..." << std::flush;
+    
+    std::string p1_prompt = 
+        "<start_of_turn>user\n"
+        "Context: " + history.substr(history.length() > 500 ? history.length() - 500 : 0) + "\n"
+        "TASK: Describe the IMMEDIATE ATMOSPHERE in extreme sensory detail.\n"
+        "FOCUS: Air density, smell, temperature, light frequency.\n"
+        "CONSTRAINT: NO human action. NO 'I'. Just the empty space waiting to be disturbed.\n"
+        "OUTPUT: 2 dense sentences.\n"
+        "<end_of_turn><start_of_turn>model\n";
+        
+    std::string atmosphere = generate_layer(state.ctx_scout, state.model_scout, p1_prompt, 80, 0.85f, {"\n\n"});
+    std::cout << " Done." << std::endl;
+    
+    // --- PHASE 2: LLAMA (THE INTRUSION) ---
+    std::cout << "[PHASE 2] Llama entering the scene..." << std::flush;
+    
+    std::string p2_prompt = 
+        "<|start_header_id|>system<|end_header_id|>\n"
+        "SCENE: " + atmosphere + "\n"
+        "IDENTITY: Biological Recording Unit.\n"
+        "TASK: The Protagonist disturbs this environment. Describe ONE physical interaction (touch, step, breath).\n"
+        "STYLE: Clinical, visceral present tense. Stop before describing the feeling.\n"
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+        "I"; 
+        
+    std::string action = generate_layer(state.ctx_main, state.model_main, p2_prompt, 60, 0.7f, {"\n", "."});
+    std::cout << " Done." << std::endl;
+
+    // --- PHASE 3: GEMMA (THE FRACTAL ZOOM) ---
+    std::cout << "[PHASE 3] Gemma magnifying texture..." << std::flush;
+    
+    std::string p3_prompt = 
+        "<start_of_turn>user\n"
+        "Action: I " + action + "\n"
+        "TASK: Zoom in x1000 on the contact point of this action.\n"
+        "DESCRIBE: The microscopic friction, the heat transfer, the texture details.\n"
+        "CONSTRAINT: Use weird, sci-fi adjectives (e.g., 'calcified', 'gelatinous', 'vibrating').\n"
+        "OUTPUT: A fragment describing the texture.\n"
+        "<end_of_turn><start_of_turn>model\n"
+        "The sensation is"; 
+        
+    std::string texture = generate_layer(state.ctx_scout, state.model_scout, p3_prompt, 80, 0.95f, {"\n"});
+    std::cout << " Done." << std::endl;
+
+    // --- PHASE 4: LLAMA (THE REACTION) ---
+    std::cout << "[PHASE 4] Llama synthesizing reaction..." << std::flush;
+    
+    std::string p4_prompt = 
+        "<|start_header_id|>system<|end_header_id|>\n"
+        "INPUT DATA:\n"
+        "1. Atmosphere: " + atmosphere + "\n"
+        "2. Action: I " + action + "\n"
+        "3. Micro-Texture: The sensation is " + texture + "\n"
+        "\n"
+        "TASK: Merge these inputs into a physiological reaction. How does the nerve ending respond?\n"
+        "OUTPUT: Finish the narrative beat.\n"
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
+        "My nerves";
+        
+    std::string reaction = generate_layer(state.ctx_main, state.model_main, p4_prompt, 100, 0.7f, {"\n\n"});
+    std::cout << " Done." << std::endl;
+
+    // --- ASSEMBLY ---
+    composite_block = atmosphere + " I " + action + ". The sensation is " + texture + ", and my nerves " + reaction;
+    
+    return composite_block;
+}
+
 // 7. GENERATE TEXT (LLaMA) - Updated with Stochastic Control
 std::string generate_text(MultiAgentState& state, const std::string& prompt, int max_tokens, NarrativeState narrative_state, std::vector<std::string>& banned_words, int attempts, std::string& out_failure_reason, bool panic_mode, float temperature) {
 
@@ -759,7 +887,11 @@ std::string generate_text(MultiAgentState& state, const std::string& prompt, int
         " like", // BAN SIMILES (space like)
         " as if", // BAN SIMILES
         // [New] Discovery Loop Breakers / Neologisms
-        "protrusion", "jagged", "writhe", "twist", "throbbles", "courscomb", "etche", "churns"
+        "protrusion", "jagged", "writhe", "twist", "throbbles", "courscomb", "etche", "churns",
+        // [LOGIC CIRCUIT 2] CAUSAL LOBOTOMY - BAN LOGIC CONNECTORS
+        "because", "therefore", "due to", " in order to", " so ", " so,", "thus", "hence", "reason", "cause", "effect",
+        // [LOGIC CIRCUIT 2] CAUSAL LOBOTOMY - BAN INFERENCE
+        "seem", "appear", "realize", "understand", "think", "believe", "know", "conclude"
     };
 
     // 1. SCRUBBING
@@ -777,10 +909,21 @@ std::string generate_text(MultiAgentState& state, const std::string& prompt, int
         "- NO Storytelling voice. USE 'I'.\n"
         "- NO Moralizing or reflecting on the sequence of events. Only survival.\n"
         "- NO Clichés (e.g., 'thick with anticipation', 'shivers down spine').\n"
+        "- NO LOGIC. NO CAUSALITY. NO 'Because'. NO 'Realize'.\n"
         "FORMATTING:\n"
         "- First-person present tense ('I see', not 'I saw').\n"
         "- Concrete, physical descriptions (temperature, texture, smell).\n"
         "- Short, punchy sentences. Fragmented thoughts are allowed."; 
+
+    // [LOGIC CIRCUIT 3] ZERO DISTANCE TOPOLOGY
+    // Logic: Focus_Point = Random([Body Part])
+    // Constraint: "Render Distance = 0"
+    std::string focus_point = pick_random({"Left Earlobe", "Right Sole", "Fingertip", "Eyelid", "Tongue", "Skin", "Nerve Ending"});
+    system_prompt += "\n[VISUAL AGNOSIA PROTOCOL ACTIVE]\n"
+                     "RENDER DISTANCE: 0 METERS. THE WORLD DOES NOT EXIST.\n"
+                     "FOCUS ANCHOR: " + focus_point + ".\n"
+                     "TASK: Describe ONLY the friction/interaction between [SURFACE] and [" + focus_point + "].\n"
+                     "DO NOT DESCRIBE THE ROOM. DO NOT LOOK UP.\n"; 
 
     if (panic_mode) {
         system_prompt += "\n[OVERRIDE] FREEZE. The world stops. Detail ONE static object with microscopic precision. No movement. No emotion.\n" + pick_random({"Describe a pebble.", "Describe a crack in the wall.", "Describe a droplet of water."});
@@ -1353,26 +1496,25 @@ int main(int argc, char* argv[]) {
         std::cout << "\n=== BLOCK " << (b + 1) << "/" << num_blocks << " ===" << std::endl;
         std::cout << "Parent TX: " << parent_tx << std::endl;
 
-        // --- LOGIC GATE: STATE TRANSITION ---
-        state_block_count++;
-        if (current_narrative_state == NarrativeState::AWAKENING && state_block_count > 2) {
-            current_narrative_state = NarrativeState::MOVEMENT;
-            std::cout << "[LOGIC GATE] Switching to MOVEMENT State." << std::endl;
-            state_block_count = 0; 
-        } else if (current_narrative_state == NarrativeState::MOVEMENT && state_block_count > 3) {
-            current_narrative_state = NarrativeState::DISCOVERY;
-             std::cout << "[LOGIC GATE] Switching to DISCOVERY State." << std::endl;
-             state_block_count = 0;
-        }
-        
-        // GENERATE
-        std::string new_content = "";
-        int attempts = 0;
-        bool panic_shunt = false;
-        bool accepted = false;
-        std::string failure_reason = ""; 
+        // --- COMPOSITE GENERATION (Accordion Topology) ---
+        std::string huge_content = generate_composite_narrative(state, full_context);
 
-        while (attempts < 3) {
+        // Sanitize & Trim
+        std::string new_content = trim_trailing_noise(huge_content);
+        
+        std::cout << "\n[RESULT] Block Size: " << new_content.length() << " chars." << std::endl;
+        std::cout << "------------------------------------------------" << std::endl;
+        std::cout << new_content << std::endl;
+        std::cout << "------------------------------------------------" << std::endl;
+
+        // LEGACY VARIABLES FOR DELETION
+        int attempts = 0;
+        bool accepted = true; // Skip legacy fallback
+        std::string failure_reason = "";
+        bool panic_shunt = false; 
+
+        // ACCORDION ACTIVATED - LEGACY LOOP DISABLED
+        while (false) {
             std::cout << "\n[LLaMA] Generating... (State: " << (int)current_narrative_state << ", Attempts: " << attempts << ")" << std::endl;
             
             // 1. PID Feedback (Hata varsa Isıt)
@@ -1412,14 +1554,14 @@ int main(int argc, char* argv[]) {
                 // We can append the instruction to the MEMORY STREAM.
                 
                 // Effective Hack:
-                 current_history_prompt += "\n[SYSTEM ALERT]: SUDDENLY, you see a " + injection + ". Describe it with horror.\n";
+                 current_history_prompt += "\n[SENSORY INTERRUPT]: NERVES REPORT: " + injection + " on [FOCUS ANCHOR]. REACTION: Visceral pain.\n";
             }
             
             // ENTROPY CALCULATION
             auto banned_words = calculate_entropy_loss(full_context);
 
-             // CALL GENERATE
-             new_content = generate_text(state, current_history_prompt, 300, current_narrative_state, banned_words, attempts, failure_reason, panic_shunt, current_temperature);
+             // CALL GENERATE (Increased to 400 tokens)
+             new_content = generate_text(state, current_history_prompt, 400, current_narrative_state, banned_words, attempts, failure_reason, panic_shunt, current_temperature);
             
             // FILTERS
             bool contaminated = is_contaminated(new_content);
@@ -1428,7 +1570,8 @@ int main(int argc, char* argv[]) {
             
             if (!contaminated && !repetitive && !gibberish) {
                 new_content = trim_trailing_noise(new_content);
-                if (new_content.length() > 150) {
+                // Lower threshold for sensory stream
+                if (new_content.length() > 50) { 
                     accepted = true; 
                     break;
                 }
@@ -1438,7 +1581,7 @@ int main(int argc, char* argv[]) {
             if (contaminated) { std::cout << "Safety/Contaminated "; failure_reason = "Safety Refusal"; }
             if (repetitive) { std::cout << "Repetitive "; failure_reason = "Repetition Loop"; }
             if (gibberish) { std::cout << "Gibberish "; failure_reason = "Model Collapse"; }
-            if (new_content.length() <= 150 && !contaminated && !repetitive && !gibberish) {
+            if (new_content.length() <= 50 && !contaminated && !repetitive && !gibberish) {
                 std::cout << "Too Short "; 
                 failure_reason = "Output Too Short";
             }
