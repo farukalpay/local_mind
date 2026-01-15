@@ -23,6 +23,7 @@
 #include "arweave.hpp"
 #include <onnxruntime_cxx_api.h> // ONNX Runtime
 #include <openssl/sha.h>
+#include <curl/curl.h>
 #include <iomanip>
 
 using json = nlohmann::json;
@@ -35,6 +36,9 @@ const std::string QWEN_CREATIVE_PATH = BASE_DIR + "models/qwen2-1.5b-instruct-q4
 const std::string QWEN_STABILIZER_PATH = BASE_DIR + "models/qwen2.5-1.5b-instruct-q4_k_m.gguf";
 const std::string MIROTHINKER_PATH = BASE_DIR + "models/MiroThinker-v1.5-30B.Q4_K_M.gguf";
 const std::string RWKV_PATH = BASE_DIR + "models/rwkv/rwkv7-g0a4-13.3b-Q4_K_M.gguf"; // [NEW] RWKV 7
+const std::string MAMBA_PATH = BASE_DIR + "models/mamba-1.4b-hf-Q4_K_M.gguf"; // [NEW] Mamba Synapse
+const std::string HERMES_PATH = BASE_DIR + "models/nous-hermes-llama2-13b.Q4_K_M.gguf"; // [NEW] Hermes Conscience
+const std::string SAUL_PATH = BASE_DIR + "models/saul-7b.gguf"; // [NEW] Saul 7B for Dynamic Prefills
 const std::string VOCAB_PATH = BASE_DIR + "models/onnx/vocab.txt";
 
 // --- HELPER ---
@@ -249,6 +253,25 @@ struct MultiAgentState {
     llama_model* model_rwkv = nullptr;
     llama_context* ctx_rwkv = nullptr;
 
+    // 11. THE SYNAPSE (Mamba SSM) - Predictive Engine
+    llama_model* model_mamba = nullptr;
+    llama_context* ctx_mamba = nullptr;
+
+    // 12. THE CONSCIENCE (Hermes 13B) - Dynamic Editor
+    llama_model* model_hermes = nullptr;
+    llama_context* ctx_hermes = nullptr;
+
+    // 13. SAUL (Prefill Generator)
+    llama_model* model_saul = nullptr;
+    llama_context* ctx_saul = nullptr;
+
+    // 14. CHRONOS (The World Engine) - Metric History
+    std::vector<float> history_entropy;    // "Wind"
+    std::vector<float> history_sentiment;  // "Temperature" (Intensity)
+    std::vector<float> history_speed;      // "Pressure" (Tokens/sec)
+    std::string current_weather = "SUNNY"; // Current Forecast
+    std::string pending_chronos_msg = "";  // Directive for next block
+    
     // 8. THE SENSOR (CodeBERT)
     std::shared_ptr<CodeBERT> sensor = nullptr;
     
@@ -263,6 +286,9 @@ struct MultiAgentState {
     // NARRATIVE STATE CONTROLLER
     int domain_index = 0; // 0=DOMESTIC_SURREAL, etc.
     int domain_streak = 0; // [NEW] Track how long we've been stuck in a domain
+
+    // 10. WORLD STATE (REBEL KNOWLEDGE GRAPH)
+    std::map<std::string, std::string> world_state; // Entity -> Status/Relation
 };
 
 // --- SEMANTIC DOMAIN DEFINITIONS ---
@@ -391,44 +417,11 @@ SemanticDomain get_contrast_domain(SemanticDomain current) {
         default: return SemanticDomain::EXTERIOR_VAST;
     }
 }
-struct Persona {
-    std::string name;
-    std::string instruction;
-    std::vector<std::string> prefills;
-    float temp;
-};
-std::deque<Persona> persona_deck;
+// [MOVED] Persona and Deck functions moved to after Model Definitions to allow access to generate_saul_prefill
 
-void shuffle_deck() {
-    std::vector<Persona> pool = {
-        // Original personas with EXPANDED prefills
-        {"KINETIC", "Focus on VELOCITY. Short sentences.", 
-            {"Impact.", "Gravity pulls", "My spine", "A crack", "Motion.", "Something shifts", "The floor lurches"}, 0.7f},
-        {"VISCERAL", "Focus on BODY HORROR.", 
-            {"Bile rises", "A tearing sound", "My lungs", "Nausea", "A spasm grips", "Something inside", "The taste of"}, 0.8f},
-        {"SURREAL", "Focus on GEOMETRY.", 
-            {"Colors bleed", "Time dilates", "The light", "Shadows", "Angles twist", "Reality bends", "Dimensions fold"}, 0.9f},
-        {"OBSERVER", "Focus on MATERIAL TEXTURE.", 
-            {"Dust settles", "Rust flakes", "The structure", "Silence.", "Metal groans", "The surface", "A mechanism"}, 0.6f},
-        // NEW: Temporal personas for structural variety
-        {"TEMPORAL", "Focus on TIME SHIFTS.", 
-            {"Yesterday's", "Three days ago", "Before the collapse", "In another time", "Once,", "The memory of"}, 0.75f},
-        {"EXTERIOR", "Focus on THIRD-PERSON perspective.", 
-            {"The machine's", "Someone else's", "A distant", "The creature's", "An unseen", "The structure's"}, 0.65f}
-    };
-    std::random_device rd; std::mt19937 g(rd());
-    std::shuffle(pool.begin(), pool.end(), g);
-    
-    persona_deck.clear();
-    for(const auto& p : pool) persona_deck.push_back(p);
-    std::cout << "[SYSTEM] Persona Deck Shuffled." << std::endl;
-}
-
-Persona draw_persona() {
-    if (persona_deck.empty()) shuffle_deck();
-    Persona p = persona_deck.front(); persona_deck.pop_front();
-    return p;
-}
+// --- FORWARD DECLARATIONS (For Saul Engine) ---
+bool ensure_model_loaded(MultiAgentState& state, llama_model** model_ptr, llama_context** ctx_ptr, const std::string& path, int n_ctx, int n_gpu_layers);
+std::string generate_layer(llama_context* ctx, llama_model* model, const std::string& prompt, int max_tokens, float temp, const std::vector<std::string>& stop_words, const std::deque<std::string>& banned_words);
 
 // --- UPDATE BAN LIST (CONCEPT JAIL) ---
 // Now with TTL (Time-To-Live) for bans - words expire after N blocks
@@ -438,88 +431,81 @@ struct BannedTerm {
 };
 static std::deque<BannedTerm> concept_jail_with_ttl;
 
-void update_ban_list(MultiAgentState& state, const std::string& text, int current_block = 0) {
-    // 1. Decrement TTL and remove expired bans
-    for (auto it = concept_jail_with_ttl.begin(); it != concept_jail_with_ttl.end();) {
-        it->blocks_remaining--;
-        if (it->blocks_remaining <= 0) {
-            std::cout << " [CONCEPT JAIL] Unbanning: " << it->word << " (TTL expired)" << std::endl;
-            it = concept_jail_with_ttl.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    
-    // 2. Kavram Tarayıcı (Expanded)
-    std::map<std::string, std::vector<std::string>> concepts = {
-        {"METAL", {"copper", "rust", "steel", "iron", "metallic", "oxidized", "chrome", "brass", "wire", "alloy", "tin", "aluminum"}},
-        {"GORE", {"blood", "bone", "flesh", "bile", "vein", "skin", "sweat", "mucus", "marrow", "viscera", "sinew", "pus"}},
-        {"CHEM", {"ozone", "sulfur", "acid", "acrid", "fumes", "chemical", "ammonia", "stench", "caustic", "chlorine", "burning rubber"}},
-        {"CLICHE", {"time stretches", "spine stiffened", "breath caught", "skin crawled", "reality unraveling", "consciousness expanding", "void staring", "puppet with no strings"}},
-        {"SENSORY_LOOP", {"metallic tang", "oil-slick", "pulsating", "throbbing", "iridescent eyes", "viscous", "gelatinous", "shards", "jagged"}},
-        {"ABSTRACT_TRAP", {"void", "consciousness", "awareness", "existence", "essence", "soul", "infinite", "eternal"}}
-    };
+// [MOVED] Global Concept Definitions
+// [DISABLED] Replaced by Hermes Dynamic Conscience
+// static std::map<std::string, std::vector<std::string>> global_concepts = {
+//     {"METAL", {"copper", "rust", "steel", "iron", "metallic", "oxidized", "chrome", "brass", "wire", "alloy", "tin", "aluminum"}},
+//     {"GORE", {"blood", "bone", "flesh", "bile", "vein", "skin", "sweat", "mucus", "marrow", "viscera", "sinew", "pus"}},
+//     {"CHEM", {"ozone", "sulfur", "acid", "acrid", "fumes", "chemical", "ammonia", "stench", "caustic", "chlorine", "burning rubber"}},
+//     {"CLICHE", {"time stretches", "spine stiffened", "breath caught", "skin crawled", "reality unraveling", "consciousness expanding", "void staring", "puppet with no strings"}},
+//     {"SENSORY_LOOP", {"metallic tang", "oil-slick", "pulsating", "throbbing", "iridescent eyes", "viscous", "gelatinous", "shards", "jagged"}},
+//     {"ABSTRACT_TRAP", {"void", "consciousness", "awareness", "existence", "essence", "soul", "infinite", "eternal"}}
+// };
 
-    std::string scan = text;
-    std::transform(scan.begin(), scan.end(), scan.begin(), ::tolower);
+// void force_concept_lock(const std::string& cat) {
+//     if (global_concepts.find(cat) == global_concepts.end()) return;
+    
+//     std::cout << " [CONCEPT JAIL] Re-locking category '" << cat << "' (Inherited/Triggered)." << std::endl;
+//     for(const auto& banned_word : global_concepts[cat]) {
+//         // Check if already in TTL jail
+//         bool already_banned = false;
+//         for (auto& existing : concept_jail_with_ttl) {
+//             if (existing.word == banned_word) {
+//                 existing.blocks_remaining = 5; // Reset TTL
+//                 already_banned = true;
+//                 break;
+//             }
+//         }
+//         if (!already_banned) {
+//             concept_jail_with_ttl.push_back({banned_word, 5});
+//         }
+//     }
+// }
 
-    for(const auto& [cat, words] : concepts) {
-        int hits = 0;
-        std::vector<std::string> matched_words;
-        for(const auto& w : words) {
-            if(scan.find(w) != std::string::npos) {
-                hits++;
-                matched_words.push_back(w);
-            }
-        }
-        // Eşik: Eğer bir blokta aynı konseptten 2 kelime geçerse, sonraki blokta O KONSEPTİ KOMPLE YASAKLA.
-        // [UPDATED] With 5-block TTL AND Capitalization
-        if(hits >= 2) {
-            std::cout << " [CONCEPT JAIL] Loop Detected in category '" << cat << "'. Locking for 5 blocks." << std::endl;
-            for(const auto& banned_word : words) {
-                // Check if already in TTL jail
-                bool already_banned = false;
-                for (auto& existing : concept_jail_with_ttl) {
-                    if (existing.word == banned_word) {
-                        existing.blocks_remaining = 5; // Reset TTL
-                        already_banned = true;
-                        break;
-                    }
-                }
-                if (!already_banned) {
-                    // Add lowercase
-                    concept_jail_with_ttl.push_back({banned_word, 5});
-                    state.recent_vocab_banlist.push_back(banned_word);
-                    
-                    // Add Capitalized (Crucial for sentence starts)
-                    std::string cap = banned_word;
-                    if(!cap.empty()) cap[0] = toupper(cap[0]);
-                    
-                    concept_jail_with_ttl.push_back({cap, 5});
-                    state.recent_vocab_banlist.push_back(cap);
-                    
-                    // Add ALL CAPS (just in case)
-                    std::string all_cap = banned_word;
-                    std::transform(all_cap.begin(), all_cap.end(), all_cap.begin(), ::toupper);
-                    if (all_cap != cap) { // Don't duplicate if word is short or same
-                         concept_jail_with_ttl.push_back({all_cap, 5});
-                         state.recent_vocab_banlist.push_back(all_cap);
-                    }
-                }
-            }
-        }
-    }
+// void update_ban_list(MultiAgentState& state, const std::string& text, int current_block = 0) {
+//     // 1. Decrement TTL and remove expired bans
+//     for (auto it = concept_jail_with_ttl.begin(); it != concept_jail_with_ttl.end();) {
+//         it->blocks_remaining--;
+//         if (it->blocks_remaining <= 0) {
+//             std::cout << " [CONCEPT JAIL] Unbanning: " << it->word << " (TTL expired)" << std::endl;
+//             it = concept_jail_with_ttl.erase(it);
+//         } else {
+//             ++it;
+//         }
+//     }
     
-    // 3. Sync TTL jail to state banlist (for use in generate_text)
-    // Clear old banlist and rebuild from TTL jail
-    state.recent_vocab_banlist.clear();
-    for (const auto& term : concept_jail_with_ttl) {
-        state.recent_vocab_banlist.push_back(term.word);
-    }
+//     // 2. Kavram Tarayıcı (Expanded)
+//     std::string scan = text;
+//     std::transform(scan.begin(), scan.end(), scan.begin(), ::tolower);
+
+//     for(const auto& [cat, words] : global_concepts) {
+//         int hits = 0;
+//         std::vector<std::string> matched_words;
+//         for(const auto& w : words) {
+//             if(scan.find(w) != std::string::npos) {
+//                 hits++;
+//                 matched_words.push_back(w);
+//             }
+//         }
+//         // Eşik: Eğer bir blokta aynı konseptten 2 kelime geçerse, sonraki blokta O KONSEPTİ KOMPLE YASAKLA.
+//         // [UPDATED] With 5-block TTL AND Capitalization
+//         if(hits >= 2) {
+//             std::cout << " [CONCEPT JAIL] Loop Detected in category '" << cat << "'. Locking for 5 blocks." << std::endl;
+//             state.recent_mistakes.push_back("CONCEPT JAIL: Loop Detected in category '" + cat + "'. Locking for 5 blocks.");
+//             // force_concept_lock(cat);
+//         }
+//     }
     
-    // Listeyi temizle (Hafıza sınırı) - increased
-    while(concept_jail_with_ttl.size() > 200) concept_jail_with_ttl.pop_front();
-}
+//     // 3. Sync TTL jail to state banlist (for use in generate_text)
+//     // Clear old banlist and rebuild from TTL jail
+//     state.recent_vocab_banlist.clear();
+//     for (const auto& term : concept_jail_with_ttl) {
+//         state.recent_vocab_banlist.push_back(term.word);
+//     }
+    
+//     // Listeyi temizle (Hafıza sınırı) - increased
+//     while(concept_jail_with_ttl.size() > 200) concept_jail_with_ttl.pop_front();
+// }
 
 // Forward Declaration
 std::string generate_layer(llama_context* ctx, llama_model* model, const std::string& prompt, int max_tokens, float temp, const std::vector<std::string>& stop_words, const std::deque<std::string>& banned_words = {});
@@ -1105,6 +1091,11 @@ void unload_all_aux(MultiAgentState& state) {
     if (state.model_qwen_creative) { llama_free(state.ctx_qwen_creative); llama_free_model(state.model_qwen_creative); state.model_qwen_creative = nullptr; state.ctx_qwen_creative = nullptr; }
     if (state.model_mirothinker) { llama_free(state.ctx_mirothinker); llama_free_model(state.model_mirothinker); state.model_mirothinker = nullptr; state.ctx_mirothinker = nullptr; }
     if (state.model_rwkv) { llama_free(state.ctx_rwkv); llama_free_model(state.model_rwkv); state.model_rwkv = nullptr; state.ctx_rwkv = nullptr; }
+    
+    // [SINGLE SLOT POLICY] Add Mamba and Hermes
+    if (state.model_mamba) { llama_free(state.ctx_mamba); llama_free_model(state.model_mamba); state.model_mamba = nullptr; state.ctx_mamba = nullptr; }
+    if (state.model_hermes) { llama_free(state.ctx_hermes); llama_free_model(state.model_hermes); state.model_hermes = nullptr; state.ctx_hermes = nullptr; }
+    if (state.model_saul) { llama_free(state.ctx_saul); llama_free_model(state.model_saul); state.model_saul = nullptr; state.ctx_saul = nullptr; }
 }
 
 bool ensure_model_loaded(MultiAgentState& state, llama_model** model_ptr, llama_context** ctx_ptr, const std::string& path, int n_ctx, int n_gpu_layers) {
@@ -1135,6 +1126,87 @@ bool ensure_model_loaded(MultiAgentState& state, llama_model** model_ptr, llama_
 }
 
 // --- DUAL ENGINE INIT ---
+// --- REBEL EXTRACTION (World State Update) ---
+// --- REBEL EXTRACTION (World State Update) ---
+std::map<std::string, std::string> run_rebel_extraction(const std::string& text) {
+    std::map<std::string, std::string> updates;
+    // Escape quotes for shell
+    std::string safe_text = "";
+    for(char c : text) {
+        if(c == '"') safe_text += "\\\"";
+        else if(c == '\\') safe_text += "\\\\";
+        else safe_text += c;
+    }
+    
+    // Call Python Script
+    std::string cmd = "python3 src/rebel_agent.py \"" + safe_text + "\"";
+    std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
+    if (!pipe) return updates;
+    
+    char buffer[1024];
+    std::string result = "";
+    while (!feof(pipe.get())) {
+        if (fgets(buffer, 1024, pipe.get()) != NULL)
+            result += buffer;
+    }
+    
+    if (result.empty()) {
+        std::cerr << " [WARN] REBEL Agent returned NO output. Process likely crashed (Check models/rebel_onnx)." << std::endl;
+        return updates;
+    }
+
+    try {
+        auto j = json::parse(result);
+        if (j.is_array()) {
+            for (const auto& item : j) {
+                if (item.contains("entity") && item.contains("status")) {
+                    updates[item["entity"]] = item["status"];
+                }
+            }
+        }
+    } catch (...) {
+        std::cerr << " [WARN] Failed to parse REBEL output." << std::endl;
+    }
+    
+    return updates;
+}
+
+// --- WORLD STATE SERIALIZER (JSON -> NARRATIVE) ---
+std::string format_world_state_narrative(const std::map<std::string, std::string>& world_state) {
+    if (world_state.empty()) return "";
+
+    std::string narrative = "KNOWN FACTS:\n";
+    for (const auto& pair : world_state) {
+        // [Template] The {ENTITY} is {STATUS}.
+        // Simple heuristic to make it flow better?
+        // If status starts with a verb, maybe "The X [status]".
+        // But REBEL usually gives "broken" or "locked".
+        narrative += "- The " + pair.first + " is " + pair.second + ".\n";
+    }
+    return narrative;
+}
+
+// --- WORLD STATE PRUNING (Hard Cap) ---
+void prune_world_state(std::map<std::string, std::string>& world_state) {
+    const size_t MAX_ITEMS = 60;
+    const size_t PRUNE_COUNT = 10;
+    
+    if (world_state.size() > MAX_ITEMS) {
+        std::cout << "[MEMORY] Pruning World State (Size: " << world_state.size() << " > " << MAX_ITEMS << ")..." << std::endl;
+        
+        // Naive Eviction: Remove first N items (Alphabetical)
+        // Ideally we would use Random or LRU, but Map is ordered.
+        // To be safe and simple: just pop begin().
+        for (size_t i = 0; i < PRUNE_COUNT; i++) {
+            if (world_state.empty()) break;
+            auto it = world_state.begin();
+            // Optional: Log what we forgot
+            // std::cout << " [FORGOT] " << it->first << std::endl;
+            world_state.erase(it);
+        }
+    }
+}
+
 void init_multi_agent(MultiAgentState& state) {
     llama_backend_init();
     
@@ -1163,6 +1235,7 @@ void init_multi_agent(MultiAgentState& state) {
     state.model_qwen_creative = nullptr; state.ctx_qwen_creative = nullptr;
     state.model_mirothinker = nullptr; state.ctx_mirothinker = nullptr;
     state.model_rwkv = nullptr; state.ctx_rwkv = nullptr;
+    state.model_saul = nullptr; state.ctx_saul = nullptr;
     
     // Init Sensors
     std::cout << "[SYSTEM] Initializing CodeBERT Sensor..." << std::endl;
@@ -1510,6 +1583,158 @@ bool is_toxic_escape_vector(const std::string& vec) {
     return false;
 }
 
+// [SAUL ENGINE] Dynamic Prefill Generator
+// Hardcoded stringleri bitiren fonksiyon budur.
+std::string generate_saul_prefill(MultiAgentState& state, std::string topic) {
+    // Bellek Kontrolü: Saul yüklü değilse yükle (Diğerlerini swap-out yap)
+    // NOT: MODEL_PATH kısmını indirdiğin "models/saul-7b.gguf" olarak güncellemelisin!
+    if (!ensure_model_loaded(state, &state.model_saul, &state.ctx_saul, SAUL_PATH, 2048, 99)) {
+        return "The evidence suggests"; // Model yüklenemezse acil durum fallback'i
+    }
+
+
+    // Saul'a özel "Hukukçu/Forensic" Prompt - Refined for robustness
+    std::string prompt = 
+        "### Instruction:\n"
+        "Generate a short, clinical, forensic sentence starter (3-5 words) for the topic: '" + topic + "'.\n"
+        "Rules: No metaphors. No repetition of the topic. Use legal/anatomical terminology.\n"
+        "Example: 'Autopsy reveals significant trauma'\n"
+        "### Response:\n";
+
+    // generate_layer fonksiyonunu çağır (Senin kodunda zaten var)
+    std::string out = generate_layer(state.ctx_saul, state.model_saul, prompt, 15, 0.7f, {"\n", ".", "\"", "[", "]", "###", ":"}, {});
+    
+    // Temizlik (Boşlukları vs sil)
+    std::string clean = trim_trailing_noise(out);
+
+    // Fallback: If output is just the topic or empty
+    if (clean.length() < 3 || clean.find(topic) != std::string::npos) {
+        return "The forensic evidence reveals";
+    }
+    return clean;
+}
+
+// [NEW] CHRONOS: The World Engine
+// Executes python script to predict narrative weather
+std::string run_chronos_forecast(MultiAgentState& state) {
+    // 1. Prepare Data
+    json j_data;
+    j_data["entropy"] = state.history_entropy;
+    j_data["sentiment"] = state.history_sentiment;
+    j_data["speed"] = state.history_speed;
+    j_data["timestamp"] = (long)std::time(nullptr); // [USER REQ] Real-time sync
+    
+    std::string valid_json = j_data.dump();
+    
+    // Escape quotes for command line (simplistic)
+    // ideal approach: write to temp file, but command line arg is faster for small data
+    std::string cmd = "python3 scripts/chronos_adapter.py '" + valid_json + "'";
+    
+    // 2. Execute
+    std::string result_json;
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return "SUNNY";
+    char buffer[128];
+    while (fgets(buffer, 128, pipe) != NULL) {
+        result_json += buffer;
+    }
+    pclose(pipe);
+    
+    // 3. Parse
+    try {
+        auto j_res = json::parse(result_json);
+        std::string forecast = j_res.value("forecast", "SUNNY");
+        std::string reason = j_res.value("reason", "Unknown");
+        
+        std::cout << " [CHRONOS] FORECAST: " << forecast << " (" << reason << ")" << std::endl;
+        
+        if (forecast == "STORM" || forecast == "WINDY") {
+            return "EVENT_INJECTION: A SUDDEN CATASTROPHE OCCURS. " + reason;
+        }
+        
+    } catch (...) {
+        std::cout << " [CHRONOS] Parse Error." << std::endl;
+    }
+    
+    return "";
+}
+
+// [UPDATED] Dynamic Persona Deck
+struct Persona {
+    std::string name;
+    std::string instruction;
+    std::vector<std::string> prefills;
+    float temp;
+};
+std::deque<Persona> persona_deck;
+
+// Artık State alıyor çünkü model çalıştırması lazım.
+void shuffle_deck(MultiAgentState& state) {
+    std::cout << "[SYSTEM] SaulLM is constructing the narrative deck (Forensic Analysis)..." << std::endl;
+
+    // 1. KATEGORİLER İÇİN CANLI ÜRETİM (Batch Generation)
+    // Her kategori için 3'er tane taze cümle üretiyoruz.
+    
+    std::vector<std::string> kinetic_dynamic;
+    for(int i=0; i<3; i++) kinetic_dynamic.push_back(generate_saul_prefill(state, "sudden physical impact or force"));
+
+    std::vector<std::string> visceral_dynamic;
+    for(int i=0; i<3; i++) visceral_dynamic.push_back(generate_saul_prefill(state, "biological trauma or internal anatomy"));
+
+    std::vector<std::string> surreal_dynamic;
+    for(int i=0; i<3; i++) surreal_dynamic.push_back(generate_saul_prefill(state, "visual distortion or hallucination evidence"));
+
+    std::vector<std::string> observer_dynamic;
+    for(int i=0; i<3; i++) observer_dynamic.push_back(generate_saul_prefill(state, "environmental decay and material structure"));
+
+    // 2. PERSONA HAVUZUNU OLUŞTUR (Artık Dinamik Veriyle)
+    std::vector<Persona> pool = {
+        
+        {"KINETIC_LOGIC", 
+         "Focus on NEWTONIAN PHYSICS. Describe force vectors.", 
+         kinetic_dynamic, // Saul'un ürettiği liste buraya giriyor
+         0.7f},
+
+        {"VISCERAL_AUTOPSY", 
+         "Focus on BIOLOGICAL FACTS. Describe anatomy like a coroner.", 
+         visceral_dynamic, 
+         0.8f},
+
+        {"SURREAL_EVIDENCE", 
+         "Focus on VISUAL ANOMALIES. Describe distortions as 'Unexplained Phenomena'.", 
+         surreal_dynamic, 
+         0.9f},
+
+        {"OBSERVER_REPORT", 
+         "Focus on MATERIAL CONDITIONS. Describe dust and rust as forensic trace.", 
+         observer_dynamic, 
+         0.6f}
+    };
+
+    // 3. KARIŞTIR VE YÜKLE
+    std::random_device rd; std::mt19937 g(rd());
+    std::shuffle(pool.begin(), pool.end(), g);
+    
+    persona_deck.clear();
+    for(const auto& p : pool) {
+        // Boş gelme ihtimaline karşı (Model hatası olursa) hardcoded fallback ekle
+        Persona final_p = p;
+        if (final_p.prefills.empty()) {
+            final_p.prefills = {"The data shows", "Observation confirms"};
+        }
+        persona_deck.push_back(final_p);
+    }
+    
+    std::cout << "[SYSTEM] Deck Shuffled with " << pool.size() * 3 << " unique generated hooks." << std::endl;
+}
+
+Persona draw_persona(MultiAgentState& state) { // State parametresi eklendi
+    if (persona_deck.empty()) shuffle_deck(state); // State ile çağır
+    Persona p = persona_deck.front(); 
+    persona_deck.pop_front();
+    return p;
+}
+
 // --- MIROTHINKER STRUCTURAL CONSTRAINT GENERATION ---
 // MiroThinker now outputs STRUCTURED constraints that are ENFORCED, not prose suggestions.
 struct RealityShift {
@@ -1734,6 +1959,70 @@ std::string generate_rwkv_veto(MultiAgentState& state, const std::string& histor
     return action;
 }
 
+// [RWKV] ESCAPE VECTOR (Phase 1 Orthogonal)
+std::string generate_rwkv_escape(MultiAgentState& state, const std::string& history) {
+    // DYNAMIC LOAD: RWKV Servo (reusing same model slot)
+    if (!ensure_model_loaded(state, &state.model_rwkv, &state.ctx_rwkv, RWKV_PATH, 2048, 99)) {
+        return "";
+    }
+    
+    std::cout << "[RWKV] Generating ESCAPE VECTOR (Orthogonal)..." << std::endl;
+    
+    // Orthogonal Thinking Prompt
+    std::string prompt = 
+        "CONTEXT: " + history.substr(history.length() > 500 ? history.length() - 500 : 0) + "\n"
+        "TASK: Ignore previous patterns. Describe a completely new sensation.\n"
+        "CONSTRAINT: Focus on liquid, atmosphere, or decay. No plot.\n"
+        "NEW_SENSATION:";
+        
+    // Higher temp for creativity
+    std::string sensation = generate_layer(state.ctx_rwkv, state.model_rwkv, prompt, 60, 1.1f, {"\n", "."}, {});
+    
+    // Cleanup
+    if (sensation.find(":") != std::string::npos) sensation = sensation.substr(sensation.find(":") + 1);
+    sensation = trim_trailing_noise(sensation);
+    
+    std::cout << "[RWKV] ESCAPE: " << sensation << std::endl;
+    return sensation;
+}
+
+// --- MAMBA SYNAPSE (PREDICTIVE STATE ENGINE) ---
+struct NeuralLinkData {
+    std::string prediction; // Mamba's expectation (Text)
+    std::string state_hash; // Current state digest (Hash)
+};
+
+NeuralLinkData run_mamba_synapse(MultiAgentState& state, const std::string& recent_context) {
+    NeuralLinkData data;
+    data.prediction = "unknown";
+    data.state_hash = "0x00";
+
+    // Dynamic Load: Mamba 1.4B
+    if (!ensure_model_loaded(state, &state.model_mamba, &state.ctx_mamba, MAMBA_PATH, 2048, 99)) {
+        std::cerr << " [WARN] Mamba Synapse offline." << std::endl;
+        return data; // Fail gracefully
+    }
+
+    std::cout << "[SYNAPSE] Mamba is dreaming of the next moment..." << std::endl;
+
+    // Prompt for Mamba: Give it the tail of the story and ask for the immediate future.
+    // Short context snippet to catch the "vibe" and "momentum".
+    std::string context_snippet = recent_context.substr(recent_context.length() > 500 ? recent_context.length() - 500 : 0);
+    
+    std::string prompt = 
+        context_snippet + 
+        "\n\n[SYSTEM PREDICTION]: The immediate next event involves"; 
+
+    // Generate short prediction (10-15 tokens is enough for a concept)
+    std::string prediction = generate_layer(state.ctx_mamba, state.model_mamba, prompt, 15, 0.8f, {".", "\n", "]", "!"}, {});
+    
+    data.prediction = trim_trailing_noise(prediction);
+    data.state_hash = sha256_string(prompt + prediction); // Simple state signature
+    
+    std::cout << " [SYNAPSE] Prediction: " << data.prediction << std::endl;
+    return data;
+}
+
 // [MIROTHINKER] ANCHOR PACK GENERATOR
 // Reality Anchor Generator: Creates a 3-block constraint package.
 AnchorPack generate_anchor_pack(MultiAgentState& state, const std::string& history) {
@@ -1760,7 +2049,24 @@ AnchorPack generate_anchor_pack(MultiAgentState& state, const std::string& histo
         "AVOID: (Cliche 2)\n"
         "RESPONSE:\n";
 
-    std::string output = generate_layer(state.ctx_mirothinker, state.model_mirothinker, prompt, 300, 0.7f, {"<|eot_id|>"}, {});
+    std::string output = "";
+    int attempts = 0;
+    while(attempts < 2) {
+        output = generate_layer(state.ctx_mirothinker, state.model_mirothinker, prompt, 300, 0.7f + (attempts * 0.1f), {"<|eot_id|>"}, {});
+        
+        // Validation: Too short?
+        if (output.length() < 20) {
+            std::cout << " [MIROTHINKER] Output too short ('" << output << "'). Retrying..." << std::endl;
+            attempts++;
+        } else {
+            break; // Good
+        }
+    }
+    
+    // Fallback if still broken
+    if (output.length() < 20) {
+        output = "SETTING: A stable void.\nOBJECTS: Dust, Stone, Light.\nPHYSICS: Standard gravity.\nDO: Observe.\n";
+    }
 
     // Parse Output (Simple Line Parsing)
     std::stringstream ss(output);
@@ -1968,7 +2274,58 @@ std::string generate_layer(llama_context* ctx, llama_model* model, const std::st
 }
 
 // [FIXED ENGINE] PERSONA-BASED NARRATIVE GENERATOR (With Head Repair & Deep Context)
-std::string generate_composite_narrative(MultiAgentState& state, const std::string& history, const std::string& summary, int domain_idx, std::string directive = "") {
+// [HERMES] DYNAMIC CONSCIENCE
+// Replaces static global_concepts map.
+// Returns a vector of words to ban specifically for THIS block.
+std::vector<std::string> generate_dynamic_constraints(MultiAgentState& state, const std::string& recent_history) {
+    std::vector<std::string> dynamic_bans;
+
+    // DYNAMIC LOAD: Nous-Hermes
+    if (!ensure_model_loaded(state, &state.model_hermes, &state.ctx_hermes, HERMES_PATH, 4096, 99)) {
+        std::cerr << " [WARN] Hermes Conscience offline. Using fallback." << std::endl;
+        return {"metal", "blood", "void"}; // Minimal fallback
+    }
+
+    std::cout << "[CONSCIENCE] Hermes is judging the narrative flow..." << std::endl;
+
+    // Felsefi ve Analitik Prompt
+    std::string prompt = 
+        "### Instruction:\n"
+        "Analyze the following narrative segment. It is in danger of becoming repetitive or cliché.\n"
+        "Identify 5 specific nouns or adjectives that are OVERUSED or would destabilize the current mood if used again immediately.\n"
+        "Think like a strict literary editor.\n"
+        "\n"
+        "NARRATIVE:\n"
+        "..." + recent_history.substr(recent_history.length() > 800 ? recent_history.length() - 800 : 0) + "\n"
+        "\n"
+        "### Response:\n"
+        "BANNED_CONCEPTS_JSON: [";
+
+    // Generate
+    std::string output = generate_layer(state.ctx_hermes, state.model_hermes, prompt, 64, 0.7f, {"]", "\n\n"}, {});
+    
+    // Parse (Basitçe virgülle ayrılmış kelimeleri veya JSON benzeri yapıyı çek)
+    // Örnek Çıktı: "shadows", "whispers", "neon", "rain", "cybernetic"
+    std::stringstream ss(output);
+    std::string segment;
+    while(std::getline(ss, segment, ',')) {
+        // Temizlik (Tırnak işaretlerini ve boşlukları kaldır)
+        segment.erase(std::remove(segment.begin(), segment.end(), '\"'), segment.end());
+        segment.erase(std::remove(segment.begin(), segment.end(), '['), segment.end());
+        segment.erase(std::remove(segment.begin(), segment.end(), ']'), segment.end());
+        while(!segment.empty() && isspace(segment.front())) segment.erase(0, 1);
+        while(!segment.empty() && isspace(segment.back())) segment.pop_back();
+        
+        if (segment.length() > 2) {
+            dynamic_bans.push_back(segment);
+            std::cout << " [CONSCIENCE BAN] " << segment << std::endl;
+        }
+    }
+    
+    return dynamic_bans;
+}
+
+std::string generate_composite_narrative(MultiAgentState& state, const std::string& history, const std::string& summary, int domain_idx, std::string directive = "", std::string premonition = "") {
     
     // 0. EXTRACT DEEP CONTEXT (Grounding)
     // Sadece son cümleyi değil, son 2000 karakteri al ki sahne kopmasın.
@@ -2048,6 +2405,17 @@ std::string generate_composite_narrative(MultiAgentState& state, const std::stri
         }
     }
     } // End else (valid gemma)
+    
+    // [USER REQ] 2.1 ADD RWKV ORTHOGONAL VECTOR
+    // RWKV 7 provides a "Linear Attention" perspective distinct from Transformer attention.
+    std::string rwkv_vec = generate_rwkv_escape(state, recent_history);
+    if (!rwkv_vec.empty()) {
+        std::string trimmed_r = trim_trailing_noise(rwkv_vec);
+        if (!is_toxic_escape_vector(trimmed_r)) {
+            options.push_back(trimmed_r);
+            std::cout << " [VECTOR ADDED] RWKV 7 Orthogonal Candidate." << std::endl;
+        }
+    }
 
     // 3. Selection by Maximum Distance
     std::string best_vector = "";
@@ -2167,7 +2535,7 @@ std::string generate_composite_narrative(MultiAgentState& state, const std::stri
     // Use the Global Persona Deck for variety
     std::cout << "[PHASE 5] Selecting Persona..." << std::flush;
     
-    Persona p = draw_persona();
+    Persona p = draw_persona(state);
     std::string prefill = pick_random(p.prefills);
     std::cout << " [" << p.name << "] -> Prefill: '" << prefill << "'..." << std::endl;
 
@@ -2208,11 +2576,29 @@ std::string generate_composite_narrative(MultiAgentState& state, const std::stri
         return text;
     };
 
+    // [PHASE 6] MIXER PROMPT (The Conductor)
+    // [UPDATED] Use Natural Language Serializer for World State
+    // std::string world_state_prompt = "";
+    // if (!state.world_state.empty()) {
+    //  world_state_prompt = "[WORLD STATE / KNOWN FACTS]\n";
+    //  for (const auto& pair : state.world_state) {
+    //      world_state_prompt += pair.first + ": " + pair.second + "\n";
+    //  }
+    //  world_state_prompt += "INSTRUCTION: You MUST respect these facts. Do not contradict them.\n";
+    // }
+    
+    std::string world_state_prompt = "";
+    if (!state.world_state.empty()) {
+        world_state_prompt = "[WORLD STATE / MEMORY]\n" + format_world_state_narrative(state.world_state) + 
+                             "INSTRUCTION: Incorporate these details naturally. Do not contradict them.\n";
+    }
+
     std::string mixer_prompt = 
         "<|start_header_id|>system<|end_header_id|>\n"
         "ROLE: You are a New Wave Sci-Fi Author (Style: J.G. Ballard, William Gibson). " + p.instruction + "\n"
         + constraint + "\n"
-        + jail_rules + "\n" // INJECT JAIL RULES
+        + jail_rules + "\n"
+        + world_state_prompt +
         "\n"
         "STORY CONTEXT (MEMORY): " + summary + "\n"
         "IMMEDIATE SURROUNDINGS (SCENE): " + recent_history.substr(recent_history.length() > 500 ? recent_history.length()-500 : 0) + "\n"
@@ -2222,6 +2608,8 @@ std::string generate_composite_narrative(MultiAgentState& state, const std::stri
         "- Shift: " + atmosphere + "\n"
         "- Reflex: I " + action + "\n"
         "- Sensation: " + texture + "\n"
+        "- NERVOUS SYSTEM PREMONITION (INSTINCT): " + (premonition.empty() ? "Unclear" : premonition) + "\n"
+        "INSTRUCTION: Incorporate the 'Premonition' subtly. The character feels this is about to happen.\n"
         "- INTERNAL IMPULSE: " + (directive.empty() ? "None" : directive) + "\n"
         "- Subconscious Spark: " + ((directive == "CONTINUE" && std::rand() % 100 < 20) ? qwen_creative_burst(state, recent_history) : "None") + "\n" // Cond 1
         "- Human Association: " + (std::rand() % 100 < 25 ? qwen_existential_association(state, recent_history) : "None") + "\n" // Cond 2
@@ -2293,6 +2681,7 @@ std::string generate_composite_narrative(MultiAgentState& state, const std::stri
                std::string cap = word; cap[0] = toupper(cap[0]);
                banned_words.push_back(cap);
                std::cout << " [CLICHE BLOCK] Banned recently used cliche: " << word << std::endl;
+               state.recent_mistakes.push_back("CLICHE BLOCK: Banned " + word);
            }
        }
     }
@@ -2308,7 +2697,53 @@ std::string generate_composite_narrative(MultiAgentState& state, const std::stri
         
         // *** CRITICAL FIX: KAFAYI GÖVDEYE DİKME İŞLEMİ ***
         // "green goo" hatasının ilacı bu satırdır. Prefill'i geri ekliyoruz.
-        final_block = prefill + strip_meta_commentary(generated_body);
+        std::string body_clean = strip_meta_commentary(generated_body);
+        if (!prefill.empty() && !body_clean.empty() && prefill.back() != ' ' && body_clean.front() != ' ' && body_clean.front() != '.') {
+            final_block = prefill + " " + body_clean;
+        } else {
+            final_block = prefill + body_clean;
+        }
+
+        // [USER REQ] CRITICAL FIX: POST-GENERATION HARD REJECT FOR CLICHES
+        // Logit bias is not enough for multi-token words (e.g. "metallic"). We must check unconditionally.
+        bool found_cliche = false;
+        std::string lower_final = final_block;
+        std::transform(lower_final.begin(), lower_final.end(), lower_final.begin(), ::tolower);
+        
+        for (const auto& banned : state.recent_vocab_banlist) {
+            std::string lower_banned = banned;
+            std::transform(lower_banned.begin(), lower_banned.end(), lower_banned.begin(), ::tolower);
+            if (!lower_banned.empty() && lower_final.find(lower_banned) != std::string::npos) {
+                std::cout << " [HARD REJECT] Found banned word: '" << banned << "' in output. Retrying..." << std::endl;
+                state.recent_mistakes.push_back("HARD REJECT: Found '" + banned + "'");
+                
+                // [FIX] Force Replace if this is the last attempt
+                if (attempts >= 2) { 
+                     std::cout << " [HARD REJECT] FATAL: Failed to clear banned word. Redacting..." << std::endl;
+                     size_t pos = lower_final.find(lower_banned);
+                     while(pos != std::string::npos) {
+                         // Find word boundaries
+                         size_t start = pos;
+                         while (start > 0 && isalpha(lower_final[start-1])) start--;
+                         size_t end = pos + banned.length();
+                         while (end < lower_final.length() && isalpha(lower_final[end])) end++;
+                         
+                         size_t len = end - start;
+                         final_block.replace(start, len, "[REDACTED]");
+                         lower_final.replace(start, len, "[REDACTED]"); // Update search string
+                         
+                         pos = lower_final.find(lower_banned, start + 10);
+                     }
+                } else {
+                    found_cliche = true;
+                    break; // Stop checking other words, just retry
+                }
+            }
+        }
+        
+        if (found_cliche) {
+            continue; // Retry loop immediately
+        }
 
         // Validasyon: Model "I felt" diyerek kolaya kaçarsa reddet.
         bool bad_style = false;
@@ -2833,7 +3268,7 @@ std::string generate_summary(MultiAgentState& state, const std::string& history)
 
 // --- NETWORK OPS ---
 std::vector<std::string> fetch_data_from_tx(const std::string& txid) {
-    if (txid == "GENESIS_TX") return {"GENESIS", "", ""};
+    if (txid == "GENESIS_TX") return {"GENESIS", "", "", "[]", "{}"};
 
     // [UPDATED] 1. CHECK LOCAL CACHE FIRST (Trust Engine)
     std::string cache_path = "cache/" + txid + ".json";
@@ -2845,16 +3280,22 @@ std::vector<std::string> fetch_data_from_tx(const std::string& txid) {
         std::string raw = buffer.str();
         try {
             auto j = json::parse(raw);
-            return {j.value("parent_tx", ""), j.value("content", ""), j.value("depth", "0")};
+            std::string mistakes_str = "[]";
+            if(j.contains("mistakes_log")) mistakes_str = j["mistakes_log"].dump();
+            std::string world_str = "{}";
+            if(j.contains("world_state")) world_str = j["world_state"].dump();
+            return {j.value("parent_tx", ""), j.value("content", ""), j.value("depth", "0"), mistakes_str, world_str};
         } catch (...) {
             std::cerr << " [ERR] Corrupt cache for " << txid << std::endl;
         }
     }
 
     // 2. NETWORK VERIFICATION (Fallback)
+    if (txid == "GENESIS") return {"", "GENESIS BLOCK", "0", "[]", "{}"};
+
     // Use absolute path
-    std::string cmd = "python3 /Users/farukalpay/Desktop/cpp/local_mind/src/uploader.py --fetch=\"" + txid + "\" 2>/dev/null";
-    std::string data;
+    std::string cmd = "python3 /Users/farukalpay/Desktop/cpp/local_mind/scripts/uploader.py --fetch=\"" + txid + "\" 2>/dev/null";
+    std::string data = "";
 
     int attempt = 0;
     int max_attempts = 5; // [UPDATED] Prevent Infinite Loop
@@ -2891,7 +3332,11 @@ std::vector<std::string> fetch_data_from_tx(const std::string& txid) {
         std::string p = j.value("parent_tx", "");
         std::string c = j.value("content", "");
         std::string d = j.value("depth", "0");
-        return {p, c, d};
+        std::string mistakes_str = "[]";
+        if(j.contains("mistakes_log")) mistakes_str = j["mistakes_log"].dump();
+        std::string world_str = "{}";
+        if(j.contains("world_state")) world_str = j["world_state"].dump();
+        return {p, c, d, mistakes_str, world_str};
     } catch (...) {
         return {};
     }
@@ -2973,7 +3418,7 @@ int main(int argc, char* argv[]) {
 
     MultiAgentState state;
     init_multi_agent(state);
-    shuffle_deck(); // [UPDATED] Init Persona Deck
+    shuffle_deck(state); // [UPDATED] Init Persona Deck with Saul
 
     // ENSURE CACHE DIR
     system("mkdir -p cache");
@@ -2989,9 +3434,13 @@ int main(int argc, char* argv[]) {
     // 2. Cache / Network Discovery
     else {
         std::ifstream last_file("last_tx.txt");
-        if (last_file.good()) {
-            std::getline(last_file, parent_tx);
-            if (!parent_tx.empty() && parent_tx.back() == '\n') parent_tx.pop_back();
+            if (last_file.good()) {
+                std::getline(last_file, parent_tx);
+                if (!parent_tx.empty()) {
+                    // Trim whitespace (improves robustness for manual edits)
+                    parent_tx.erase(0, parent_tx.find_first_not_of(" \n\r\t"));
+                    parent_tx.erase(parent_tx.find_last_not_of(" \n\r\t") + 1);
+                }
             
             // Validate Hash
             bool valid = !parent_tx.empty() && parent_tx.length() < 100;
@@ -3012,10 +3461,11 @@ int main(int argc, char* argv[]) {
     }
 
     std::string full_context = "";
+    std::vector<std::string> history;
 
     // CONTEXT LOADING
     if (parent_tx != "GENESIS_TX") {
-        auto history = reconstruct_narrative(parent_tx, MAX_DEPTH);
+        history = reconstruct_narrative(parent_tx, MAX_DEPTH);
         for (const auto& block : history) {
             full_context += block + " ";
         }
@@ -3061,6 +3511,52 @@ int main(int argc, char* argv[]) {
         std::cout << "[SYSTEM] Starting New Chain (Genesis Pending...)" << std::endl;
     }
 
+    // [MISTAKE INHERITANCE] Re-hydrate Concept Jail from parent
+    if (parent_tx != "GENESIS_TX") {
+        std::cout << "[SYSTEM] Checking parent for inherited constraints..." << std::endl;
+        auto parent_data = fetch_data_from_tx(parent_tx); // 0=Parent, 1=Content, 2=Depth, 3=Mistakes
+        if (parent_data.size() >= 5) {
+            // [MISTAKE INHERITANCE] - already handled in loop above? No we need to check size.
+            // Wait, I messed up the order. Let's cleaner.
+            
+            // 1. Mistakes
+            std::string mistakes_json = parent_data[3];
+            try {
+                auto j_mistakes = json::parse(mistakes_json);
+                if (j_mistakes.is_array()) {
+                    for (const auto& m : j_mistakes) {
+                        std::string msg = m.get<std::string>();
+                        if (msg.find("CONCEPT JAIL: Loop Detected in category") != std::string::npos) {
+                            // ... (Logic kept same, just ensuring scope) ...
+                            // Extract category logic duplicate... let's trust existing code for now?
+                            // Actually I am replacing the block. I need to keep the mistake logic AND add world state.
+                            size_t start_cat = msg.find("'") + 1;
+                            size_t end_cat = msg.find("'", start_cat);
+                            if (start_cat != std::string::npos && end_cat != std::string::npos) {
+                                std::string cat = msg.substr(start_cat, end_cat - start_cat);
+                                std::cout << "[SYSTEM] Inheriting Concept Jail Lock for: " << cat << " [DISABLED - LEGACY]" << std::endl;
+                                // force_concept_lock(cat);
+                                state.recent_mistakes.push_back("INHERITED LOCK: " + cat);
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+
+            // 2. World State
+            std::string world_json = parent_data[4];
+            try {
+                 auto j_world = json::parse(world_json);
+                 if (j_world.is_object()) {
+                     std::cout << "[SYSTEM] Inheriting World State (" << j_world.size() << " facts)..." << std::endl;
+                     for (auto& element : j_world.items()) {
+                         state.world_state[element.key()] = element.value();
+                     }
+                 }
+            } catch (...) {}
+        }
+    }
+
     
     NarrativeState current_narrative_state = NarrativeState::AWAKENING;
     int state_block_count = 0;
@@ -3074,26 +3570,63 @@ int main(int argc, char* argv[]) {
         std::cout << "\n=== BLOCK " << (b + 1) << "/" << num_blocks << " ===" << std::endl;
         std::cout << "Parent TX: " << parent_tx << std::endl;
         
-        // [FIX] Clear mistakes from previous block
         state.recent_mistakes.clear();
 
-        // --- COMPOSITE GENERATION (Accordion Topology) ---
-        // --- COMPOSITE GENERATION (Accordion Topology) ---
-        // --- COMPOSITE GENERATION (Accordion Topology + Reflex Loop) ---
+        // --- [STEP 0] MAMBA SYNAPSE (PRE-COGNITION) ---
+        NeuralLinkData synapse_data;
+        if (parent_tx != "GENESIS_TX") {
+            synapse_data = run_mamba_synapse(state, full_context);
+        } else {
+            synapse_data.prediction = "Genesis Initialization";
+        }
+
+        // --- [STEP 0.5] HERMES CONSCIENCE (DYNAMICS) ---
+        // Replaces static bans. Hermes decides what is banned for this block.
+        std::vector<std::string> dynamic_bans;
+        if (parent_tx != "GENESIS_TX") {
+            dynamic_bans = generate_dynamic_constraints(state, full_context);
+            
+            // Add to state.recent_vocab_banlist
+            state.recent_vocab_banlist.clear(); // Clear old (Now fully dynamic)
+            for(const auto& w : dynamic_bans) {
+                state.recent_vocab_banlist.push_back(w);
+            }
+        }
+
+        // --- [STEP 1] GENERATE ---
         std::string huge_content = "";
         std::string directive = "";
         
+        // [CHRONOS] Apply Divine Intervention if forecast demands it
+        if (!state.pending_chronos_msg.empty()) {
+            std::cout << " [CHRONOS] Applying World Engine Directive: " << state.pending_chronos_msg << std::endl;
+            directive = state.pending_chronos_msg;
+            state.pending_chronos_msg = ""; // Consumed
+        }
+
+        std::string new_content = ""; 
+        bool accepted = false;
+        std::string failure_reason = "None";
+        int attempts = 0;
+        bool panic_shunt = false;
+
         // [USER INJECTION] First Block Only
         if (b == 0 && !user_init_prompt.empty()) {
             directive = user_init_prompt;
-            std::cout << "[SYSTEM] Injecting User Impulse: " << user_init_prompt << std::endl;
         }
 
-        float reflex_score = 0.0f; // Track similarity for logging
         int reflex_attempts = 0;
-        
+        float reflex_score = 0.0f; 
+
         while (reflex_attempts < 3) {
-            huge_content = generate_composite_narrative(state, full_context, current_summary_text, state.domain_index, directive);
+            huge_content = generate_composite_narrative(
+                state, 
+                full_context, 
+                current_summary_text, 
+                state.domain_index, 
+                directive,
+                synapse_data.prediction // <-- Mamba's Prediction
+            );
             
             // [JUDGE] DeBERTa NLI Logic Check (User Request)
             if (state.deberta) {
@@ -3162,6 +3695,22 @@ int main(int argc, char* argv[]) {
                      
                      // Apply anti-consensus to PID controller baseline
                      current_temperature = std::min(1.5f, pid.setpoint + anti_consensus_temp_boost);
+
+                     // 2.5. THE SERVO (RWKV 7) - Differential Component (Fast Veto)
+                     // [USER_REQUEST] Prioritize fast Linear Attention intervention before expensive MiroThinker.
+                     std::string rwkv_veto = generate_rwkv_veto(state, full_context + huge_content);
+                     if (!rwkv_veto.empty()) {
+                         std::cout << " [RWKV] SERVO ACTIVATED. Differential Veto: " << rwkv_veto << std::endl;
+                         
+                         // Immediate Action Injection
+                         directive = "IMMEDIATE_ACTION: " + rwkv_veto;
+                         
+                         // Add to constraints to prevent immediate recurrence
+                         state.recent_vocab_banlist.push_back("stagnation"); 
+                         
+                         reflex_attempts++;
+                         continue; // Fast break!
+                     }
 
                      // 3. MIROTHINKER STRUCTURAL INTERVENTION (The Integral Component)
                      if (state.ctx_mirothinker) {
@@ -3288,7 +3837,7 @@ int main(int argc, char* argv[]) {
         blocks_since_reflex++;
 
         // Sanitize & Trim
-        std::string new_content = trim_trailing_noise(huge_content);
+        new_content = trim_trailing_noise(huge_content);
         
         std::cout << "\n[RESULT] Block Size: " << new_content.length() << " chars." << std::endl;
         std::cout << "------------------------------------------------" << std::endl;
@@ -3302,7 +3851,8 @@ int main(int argc, char* argv[]) {
             if(state.history_embeddings.size() > 50) state.history_embeddings.erase(state.history_embeddings.begin());
             
             // [UPDATED] Update Concept Jail
-            update_ban_list(state, new_content);
+            // [UPDATED] Update Concept Jail - DISABLED for Hermes Integration
+            // update_ban_list(state, new_content);
             
             // [DOMAIN TRACKING] Continuous State Update
             SemanticDomain current_dom = detect_semantic_domain(state, new_content);
@@ -3310,10 +3860,10 @@ int main(int argc, char* argv[]) {
         }
 
         // LEGACY VARIABLES FOR DELETION
-        int attempts = 0;
-        bool accepted = true; // Skip legacy fallback
-        std::string failure_reason = "";
-        bool panic_shunt = false; 
+        attempts = 0;
+        accepted = true; // Skip legacy fallback
+        failure_reason = "";
+        panic_shunt = false; 
 
         // ACCORDION ACTIVATED - LEGACY LOOP DISABLED
         while (false) {
@@ -3410,6 +3960,18 @@ int main(int argc, char* argv[]) {
             new_content = "I blink. The world resets. I focus on the cold stone beneath me.";
         }
 
+        // [REBEL] Update World State
+        std::cout << "[REBEL] Scanning for World State changes..." << std::endl;
+        auto rebel_updates = run_rebel_extraction(new_content);
+        if (!rebel_updates.empty()) {
+            std::cout << "[REBEL] Extracted " << rebel_updates.size() << " new facts." << std::endl;
+            for (const auto& pair : rebel_updates) {
+                state.world_state[pair.first] = pair.second;
+                std::cout << " + " << pair.first << ": " << pair.second << std::endl;
+            }
+            // [PHASE 2] Prune after update
+            prune_world_state(state.world_state);
+        }
         // UPLOAD NARRATIVE
         std::cout << "[ARWEAVE] Uploading Narrative..." << std::endl;
         
@@ -3425,7 +3987,20 @@ int main(int argc, char* argv[]) {
 
         // SPLIT-GENESIS LOGGING
         // 1. Private Data (Reasoning, Metrics, Directive)
+        
+        // --- DIVERGENCE CALCULATION ---
+        float divergence = 0.0f;
+        if (state.sensor) {
+            std::vector<float> pred_vec = state.sensor->embed(synapse_data.prediction);
+            std::vector<float> actual_vec = state.sensor->embed(new_content);
+            divergence = 1.0f - state.sensor->cosine_similarity(pred_vec, actual_vec);
+        }
+
         json private_data;
+        private_data["pid_state"] = {
+            {"temp", current_temperature},
+            {"complexity", calculate_token_entropy(new_content)} // Assuming entropy_score is this
+        };
         private_data["parent"] = parent_tx;
         private_data["refs"] = refs;
         private_data["observer"] = (reflex_score > 0.91f) ? "phi-2" : "llama-3-8b";
@@ -3438,13 +4013,27 @@ int main(int argc, char* argv[]) {
         json public_payload;
         public_payload["genesis_txid"] = root_genesis_txid; // [FIXED] Hereditary TXID
 
+        public_payload["program"] = "LOCAL_MIND_v3_DUAL_ENGINE";
+        public_payload["model"] = "Llama-3-8B-Instruct + Gemma-2-2B";
+        public_payload["neural_link"] = {
+            {"prev_state_hash", synapse_data.state_hash},
+            {"predicted_next", synapse_data.prediction},
+            {"divergence_score", divergence}
+        }; 
         public_payload["event"] = "instruction_generated";
         public_payload["intent"] = "procedural_instruction";
         public_payload["timestamp"] = std::time(0);
         public_payload["commitment"] = sha256_string(private_data.dump()); // Hash of private reasoning
+        public_payload["summary"] = current_summary_text; // Include latest summary
+        public_payload["depth"] = std::to_string(history.size() + 1); // Depth
+        public_payload["mistakes_rag"] = state.recent_mistakes; // [NEW] mistakes log
+        public_payload["world_state"] = state.world_state; // [REBEL] Persist World State
+        public_payload["chronos"] = {
+            {"weather", state.current_weather},
+            {"pending_intervention", state.pending_chronos_msg} 
+        };
         public_payload["content"] = new_content; // The Narrative Block itself
         public_payload["parent_tx"] = parent_tx;
-        public_payload["mistakes_log"] = state.recent_mistakes; // [NEW] Feedback Loop Data
         
         // Metadata for Uploader (Tags)
         // We'll write public_payload to file
@@ -3460,7 +4049,7 @@ int main(int argc, char* argv[]) {
         if (!last_summary_txid.empty()) tag_arg += ",Summary-Tx=" + last_summary_txid;
         tag_arg += "'"; 
 
-        std::string cmd = "python3 /Users/farukalpay/Desktop/cpp/local_mind/src/uploader.py --content FILE:" + payload_file + " --parent=\"" + safe_parent + "\" " + tag_arg;
+        std::string cmd = "python3 /Users/farukalpay/Desktop/cpp/local_mind/scripts/uploader.py --content FILE:" + payload_file + " --parent=\"" + safe_parent + "\" " + tag_arg;
         
         std::string txid;
         std::string raw_output = "";
@@ -3505,6 +4094,20 @@ int main(int argc, char* argv[]) {
             full_context += new_content + " ";
             blocks_since_summary++;
             
+            // [CHRONOS] METRIC TRACKING & FORECAST
+            float ent = calculate_token_entropy(new_content);
+            state.history_entropy.push_back(ent);
+            state.history_sentiment.push_back(current_temperature);
+            state.history_speed.push_back((float)new_content.length()); 
+
+            if(state.history_entropy.size() > 10) state.history_entropy.erase(state.history_entropy.begin());
+            if(state.history_sentiment.size() > 10) state.history_sentiment.erase(state.history_sentiment.begin());
+            if(state.history_speed.size() > 10) state.history_speed.erase(state.history_speed.begin());
+
+            std::cout << "[CHRONOS] Sampling Weather... (Ent=" << ent << ", Temp=" << current_temperature << ")" << std::endl;
+            state.pending_chronos_msg = run_chronos_forecast(state);
+            state.current_weather = (state.pending_chronos_msg.empty()) ? "SUNNY" : "STORM";
+
             std::ofstream out("last_tx.txt");
             out << txid;
             out.close();
@@ -3543,6 +4146,10 @@ int main(int argc, char* argv[]) {
 
     if (state.ctx_mirothinker) llama_free(state.ctx_mirothinker);
     if (state.model_mirothinker) llama_model_free(state.model_mirothinker);
+    if (state.ctx_rwkv) llama_free(state.ctx_rwkv);
+    if (state.model_rwkv) llama_model_free(state.model_rwkv);
+    if (state.ctx_mamba) llama_free(state.ctx_mamba);
+    if (state.model_mamba) llama_model_free(state.model_mamba);
 
     llama_backend_free();
     return 0;
