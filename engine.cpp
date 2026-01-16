@@ -3,7 +3,15 @@
 // Goal: Raw Consciousness Stream (No "Assistant" artifacts)
 
 #include "llama.h"
+#include <cctype>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <filesystem>
 #include <iostream>
+#include <array>
+#include <memory>
+#include <system_error>
 #include <vector>
 #include <map>
 #include <set>
@@ -20,7 +28,6 @@
 
 #include <nlohmann/json.hpp>
 #include "arweave.hpp"
-#include "arweave.hpp"
 #include <onnxruntime_cxx_api.h> // ONNX Runtime
 #include <openssl/sha.h>
 #include <curl/curl.h>
@@ -31,7 +38,11 @@ using json = nlohmann::json;
 // --- CONFIGURATION ---
 const int MAX_DEPTH = 20; // [UPDATED] Expanded Context Window
 const std::string BASE_DIR = "/Users/farukalpay/Desktop/cpp/local_mind/";
-const std::string MODEL_PATH = BASE_DIR + "models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf";
+const std::string MODEL_PATH = BASE_DIR + "models/dolphin-2.9.4-llama3.1-8b-Q4_K_M.gguf";
+const std::string GEMMA_PATH = BASE_DIR + "models/gemma-2-2b-it-Q4_K_M.gguf";
+const std::string PHI_PATH = BASE_DIR + "models/phi-2.Q4_K_M.gguf";
+const std::string DEEPSEEK_PATH = BASE_DIR + "models/deepseek-math-7b.Q4_K_M.gguf";
+const std::string FIMBULVETR_PATH = BASE_DIR + "models/Fimbulvetr-11B-v2-Test-14.q4_K_M.gguf";
 const std::string QWEN_CREATIVE_PATH = BASE_DIR + "models/qwen2-1.5b-instruct-q4_k_m.gguf";
 const std::string QWEN_STABILIZER_PATH = BASE_DIR + "models/qwen2.5-1.5b-instruct-q4_k_m.gguf";
 const std::string MIROTHINKER_PATH = BASE_DIR + "models/MiroThinker-v1.5-30B.Q4_K_M.gguf";
@@ -39,7 +50,83 @@ const std::string RWKV_PATH = BASE_DIR + "models/rwkv/rwkv7-g0a4-13.3b-Q4_K_M.gg
 const std::string MAMBA_PATH = BASE_DIR + "models/mamba-1.4b-hf-Q4_K_M.gguf"; // [NEW] Mamba Synapse
 const std::string HERMES_PATH = BASE_DIR + "models/nous-hermes-llama2-13b.Q4_K_M.gguf"; // [NEW] Hermes Conscience
 const std::string SAUL_PATH = BASE_DIR + "models/saul-7b.gguf"; // [NEW] Saul 7B for Dynamic Prefills
+const std::string CODEBERT_MODEL_PATH = BASE_DIR + "models/onnx/model_int8.onnx";
 const std::string VOCAB_PATH = BASE_DIR + "models/onnx/vocab.txt";
+
+const int GPU_LAYERS_METAL = 99;
+const int GPU_LAYERS_CPU = 0;
+
+const int MAIN_CTX = 16384;
+const int SCOUT_CTX = 4096;
+const int PHI_CTX = 2048;
+const int QWEN_STABILIZER_CTX = 4096;
+const int QWEN_CREATIVE_CTX = 2048;
+const int MIROTHINKER_CTX = 4096;
+const int FIMBULVETR_CTX = 4096;
+const int RWKV_CTX = 2048;
+const int MAMBA_CTX = 2048;
+const int HERMES_CTX = 4096;
+const int SAUL_CTX = 2048;
+const int LOGIC_CTX = 4096;
+
+constexpr size_t kEmbeddingDim = 768;
+constexpr size_t kEmbeddingHistoryCapacity = 50;
+using Embedding = std::array<float, kEmbeddingDim>;
+
+struct EmbeddingRing {
+    std::array<Embedding, kEmbeddingHistoryCapacity> buffer{};
+    size_t head = 0;
+    size_t count = 0;
+
+    void clear() {
+        head = 0;
+        count = 0;
+    }
+
+    bool empty() const {
+        return count == 0;
+    }
+
+    size_t size() const {
+        return count;
+    }
+
+    void push(const Embedding& value) {
+        buffer[head] = value;
+        head = (head + 1) % kEmbeddingHistoryCapacity;
+        if (count < kEmbeddingHistoryCapacity) {
+            ++count;
+        }
+    }
+
+    template <typename Fn>
+    void for_each_recent(Fn&& fn, size_t max_items = kEmbeddingHistoryCapacity) const {
+        size_t n = std::min(max_items, count);
+        for (size_t i = 0; i < n; ++i) {
+            size_t idx = (head + kEmbeddingHistoryCapacity - 1 - i) % kEmbeddingHistoryCapacity;
+            fn(buffer[idx], i);
+        }
+    }
+};
+
+namespace {
+constexpr size_t kTokenScratchPad = 128;
+constexpr size_t kAvgTokenChars = 4;
+
+std::vector<llama_token>& token_scratch(size_t min_size) {
+    static thread_local std::vector<llama_token> tokens;
+    if (tokens.size() < min_size) {
+        tokens.resize(min_size);
+    }
+    return tokens;
+}
+
+Embedding make_filled_embedding(float value) {
+    Embedding e;
+    e.fill(value);
+    return e;
+}
+} // namespace
 
 // --- HELPER ---
 std::string sanitize_shell_input(const std::string& input) {
@@ -117,16 +204,11 @@ public:
         return tokens;
     }
 
-    std::vector<float> embed(const std::string& text) {
+    Embedding embed(const std::string& text) {
         // [PYTHON BRIDGE] Call src/embed.py due to ONNX restoration complexity
-        std::string cmd = "python3 src/embed.py \"" + sanitize_shell_input(text) + "\"";
-        // sanitize_shell_input not defined in scope yet? It's a helper function.
-        // I need to confirm sanitize_shell_input is available to this class.
-        // It is defined usually later or earlier.
-        // If not available, I'll do basic quote escaping.
-        
         // Basic escaping
-        std::string safe_text = "";
+        std::string safe_text;
+        safe_text.reserve(text.size() + 16);
         for(char c : text) {
             if(c == '"') safe_text += "\\\"";
             else if(c == '\\') safe_text += "\\\\";
@@ -135,10 +217,11 @@ public:
         
         std::string cmd_safe = "python3 src/embed.py \"" + safe_text + "\"";
         std::shared_ptr<FILE> pipe(popen(cmd_safe.c_str(), "r"), pclose);
-        if (!pipe) return std::vector<float>(768, 0.0f);
+        if (!pipe) return make_filled_embedding(0.0f);
         
         char buffer[1024]; // Increase buffer
-        std::string result = "";
+        std::string result;
+        result.reserve(8192);
         while (!feof(pipe.get())) {
             if (fgets(buffer, 1024, pipe.get()) != NULL)
                 result += buffer;
@@ -147,19 +230,20 @@ public:
         // Parse JSON [0.1, 0.2, ...]
         try {
             auto j = json::parse(result);
-            std::vector<float> vec;
-            for (auto& el : j) vec.push_back(el.get<float>());
-            if (vec.size() != 768) return std::vector<float>(768, 0.001f);
+            if (!j.is_array() || j.size() != kEmbeddingDim) return make_filled_embedding(0.001f);
+            Embedding vec;
+            for (size_t i = 0; i < kEmbeddingDim; ++i) {
+                vec[i] = j[i].get<float>();
+            }
             return vec;
         } catch (...) {
-            return std::vector<float>(768, 0.001f);
+            return make_filled_embedding(0.001f);
         }
     }
 
-    float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b) {
-        if (a.empty() || b.empty() || a.size() != b.size()) return 0.0f;
+    float cosine_similarity(const Embedding& a, const Embedding& b) {
         float dot = 0.0f, norm_a = 0.0f, norm_b = 0.0f;
-        for (size_t i = 0; i < a.size(); ++i) {
+        for (size_t i = 0; i < kEmbeddingDim; ++i) {
             dot += a[i] * b[i];
             norm_a += a[i] * a[i];
             norm_b += b[i] * b[i];
@@ -168,19 +252,19 @@ public:
     }
 
     // [RESTORED] Compute Centroid of Embeddings
-    std::vector<float> compute_centroid(const std::vector<std::vector<float>>& history) {
-        if (history.empty()) return std::vector<float>(768, 0.0f);
-        
-        std::vector<float> centroid(768, 0.0f);
-        for (const auto& vec : history) {
-            if (vec.size() != 768) continue;
-            for (size_t i = 0; i < 768; ++i) {
+    Embedding compute_centroid(const EmbeddingRing& history) {
+        if (history.empty()) return make_filled_embedding(0.0f);
+
+        Embedding centroid = make_filled_embedding(0.0f);
+        history.for_each_recent([&](const Embedding& vec, size_t) {
+            for (size_t i = 0; i < kEmbeddingDim; ++i) {
                 centroid[i] += vec[i];
             }
-        }
-        
-        for (size_t i = 0; i < 768; ++i) {
-            centroid[i] /= history.size();
+        }, history.size());
+
+        float inv = 1.0f / static_cast<float>(history.size());
+        for (size_t i = 0; i < kEmbeddingDim; ++i) {
+            centroid[i] *= inv;
         }
         return centroid;
     }
@@ -245,6 +329,10 @@ struct MultiAgentState {
     llama_model* model_qwen_creative = nullptr;
     llama_context* ctx_qwen_creative = nullptr;
 
+    // 5b. THE OBSERVER (Fimbulvetr 11B) - First-person enforcement
+    llama_model* model_fimbulvetr = nullptr;
+    llama_context* ctx_fimbulvetr = nullptr;
+
     // 6. THE REASONER (MiroThinker 30B) - "Integral" Component
     llama_model* model_mirothinker = nullptr;
     llama_context* ctx_mirothinker = nullptr;
@@ -265,20 +353,28 @@ struct MultiAgentState {
     llama_model* model_saul = nullptr;
     llama_context* ctx_saul = nullptr;
 
+    // 15. THE NAVIGATOR (DeepSeek-Math 7B) - Logic & Causality
+    llama_model* model_logic = nullptr;
+    llama_context* ctx_logic = nullptr;
+
     // 14. CHRONOS (The World Engine) - Metric History
     std::vector<float> history_entropy;    // "Wind"
     std::vector<float> history_sentiment;  // "Temperature" (Intensity)
     std::vector<float> history_speed;      // "Pressure" (Tokens/sec)
-    std::string current_weather = "SUNNY"; // Current Forecast
+    std::string current_weather = "UNKNOWN"; // Current Forecast
+
     std::string pending_chronos_msg = "";  // Directive for next block
+    std::vector<std::string> weather_history; // [NEW] Track past weather concepts for vector prediction
+
     
     // 8. THE SENSOR (CodeBERT)
     std::shared_ptr<CodeBERT> sensor = nullptr;
     
     // HISTORY EMBEDDINGS (For Repetition Detection)
-    std::vector<std::vector<float>> history_embeddings;
+    EmbeddingRing history_embeddings;
     std::deque<std::string> recent_vocab_banlist; // Dynamic Ban List
     std::vector<std::string> recent_mistakes; // [NEW] RAG for Mistakes
+    std::vector<Embedding> sentence_memory; // Sentence-level novelty buffer
     
     // 9. THE JUDGE (DeBERTa NLI)
     std::shared_ptr<DeBERTaNLI> deberta = nullptr;
@@ -289,7 +385,91 @@ struct MultiAgentState {
 
     // 10. WORLD STATE (REBEL KNOWLEDGE GRAPH)
     std::map<std::string, std::string> world_state; // Entity -> Status/Relation
+
+    // 16. WEATHER ORACLE (Vector Bank)
+    struct WeatherOracle* weather_oracle = nullptr;
 };
+
+// --- WEATHER ORACLE IMPLEMENTATION ---
+struct WeatherOracle {
+    std::map<std::string, Embedding> vector_bank;
+    std::shared_ptr<CodeBERT> sensor;
+
+    WeatherOracle(std::shared_ptr<CodeBERT> s) : sensor(s) {
+        init_bank();
+    }
+
+    void init_bank() {
+        if(!sensor) return;
+        std::cout << "[SYSTEM] Initializing Weather Oracle (Vector Bank)..." << std::endl;
+        // Core weather archetypes
+        vector_bank["CALM"] = sensor->embed("The air is still. Silence. No wind. Peaceful atmosphere.");
+        vector_bank["WINDY"] = sensor->embed("Strong gusts of wind. Howling air. Moving dust. Turbulence.");
+        vector_bank["STORM"] = sensor->embed("Heavy rain. Thunder. Lightning. Chaos. Violent weather.");
+        vector_bank["RAIN"] = sensor->embed("Steady rainfall. Wet surfaces. Dripping water. Gloom.");
+        vector_bank["FOG"] = sensor->embed("Thick mist. Low visibility. Hazy white air. Obscured vision.");
+        vector_bank["CLEAR"] = sensor->embed("Bright sky. High visibility. Sharp details. No clouds.");
+        vector_bank["SNOW"] = sensor->embed("Falling snow. Cold air. White ground. Frost. Freezing.");
+    }
+
+    std::string predict_next(const std::vector<std::string>& history, float entropy_score, float sentiment_score) {
+        if (!sensor || vector_bank.empty()) return "UNKNOWN";
+
+        // 1. Calculate History Vector (Mean of last 5)
+        Embedding mean_vec = make_filled_embedding(0.0f);
+        int count = 0;
+        int max_hist = 5;
+        for (auto it = history.rbegin(); it != history.rend(); ++it) {
+            Embedding vec = sensor->embed(*it);
+            for(size_t i=0; i<kEmbeddingDim; ++i) mean_vec[i] += vec[i];
+            count++;
+            if(count >= max_hist) break;
+        }
+
+        if (count > 0) {
+            float inv = 1.0f / count;
+            for(size_t i=0; i<kEmbeddingDim; ++i) mean_vec[i] *= inv;
+        } else {
+             // Default to CALM if no history
+             mean_vec = vector_bank["CALM"];
+        }
+
+        // 2. Apply Chronos Modulation (Displace Vector)
+        // High Entropy -> Push towards Chaos/Storm vectors
+        // We simulate this by blending with the "STORM" vector based on entropy
+        // Or adding random noise scaled by entropy.
+        
+        // Simple Logic: Target Vector = (1 - alpha) * Mean + alpha * (Entropy > 0.7 ? STORM : CALM)
+        // Actually, let's just use the Metrics to bias the selection, but do it vectorially.
+        // We will displace the mean vector towards "STORM" if entropy is high.
+        
+        Embedding target = mean_vec;
+        float chaos_factor = std::max(0.0f, (entropy_score - 0.5f) * 2.0f); // 0.5 -> 0, 1.0 -> 1.0
+        
+        if (chaos_factor > 0) {
+            Embedding storm_vec = vector_bank["STORM"];
+            for(size_t i=0; i<kEmbeddingDim; ++i) {
+                target[i] = target[i] * (1.0f - chaos_factor) + storm_vec[i] * chaos_factor;
+            }
+        }
+        
+        // 3. Find Nearest Neighbor
+        std::string best_label = "UNKNOWN";
+        float best_sim = -1.0f;
+
+        for (const auto& [label, vec] : vector_bank) {
+            float sim = sensor->cosine_similarity(target, vec);
+            if (sim > best_sim) {
+                best_sim = sim;
+                best_label = label;
+            }
+        }
+        
+        std::cout << " [WEATHER ORACLE] Forecast Vector -> " << best_label << " (Sim: " << best_sim << ", Chaos: " << chaos_factor << ")" << std::endl;
+        return best_label;
+    }
+};
+
 
 // --- SEMANTIC DOMAIN DEFINITIONS ---
 enum class SemanticDomain {
@@ -422,6 +602,7 @@ SemanticDomain get_contrast_domain(SemanticDomain current) {
 // --- FORWARD DECLARATIONS (For Saul Engine) ---
 bool ensure_model_loaded(MultiAgentState& state, llama_model** model_ptr, llama_context** ctx_ptr, const std::string& path, int n_ctx, int n_gpu_layers);
 std::string generate_layer(llama_context* ctx, llama_model* model, const std::string& prompt, int max_tokens, float temp, const std::vector<std::string>& stop_words, const std::deque<std::string>& banned_words);
+std::string fimbulvetr_first_person(MultiAgentState& state, const std::string& source);
 
 // --- UPDATE BAN LIST (CONCEPT JAIL) ---
 // Now with TTL (Time-To-Live) for bans - words expire after N blocks
@@ -430,82 +611,6 @@ struct BannedTerm {
     int blocks_remaining; // Countdown to unban
 };
 static std::deque<BannedTerm> concept_jail_with_ttl;
-
-// [MOVED] Global Concept Definitions
-// [DISABLED] Replaced by Hermes Dynamic Conscience
-// static std::map<std::string, std::vector<std::string>> global_concepts = {
-//     {"METAL", {"copper", "rust", "steel", "iron", "metallic", "oxidized", "chrome", "brass", "wire", "alloy", "tin", "aluminum"}},
-//     {"GORE", {"blood", "bone", "flesh", "bile", "vein", "skin", "sweat", "mucus", "marrow", "viscera", "sinew", "pus"}},
-//     {"CHEM", {"ozone", "sulfur", "acid", "acrid", "fumes", "chemical", "ammonia", "stench", "caustic", "chlorine", "burning rubber"}},
-//     {"CLICHE", {"time stretches", "spine stiffened", "breath caught", "skin crawled", "reality unraveling", "consciousness expanding", "void staring", "puppet with no strings"}},
-//     {"SENSORY_LOOP", {"metallic tang", "oil-slick", "pulsating", "throbbing", "iridescent eyes", "viscous", "gelatinous", "shards", "jagged"}},
-//     {"ABSTRACT_TRAP", {"void", "consciousness", "awareness", "existence", "essence", "soul", "infinite", "eternal"}}
-// };
-
-// void force_concept_lock(const std::string& cat) {
-//     if (global_concepts.find(cat) == global_concepts.end()) return;
-    
-//     std::cout << " [CONCEPT JAIL] Re-locking category '" << cat << "' (Inherited/Triggered)." << std::endl;
-//     for(const auto& banned_word : global_concepts[cat]) {
-//         // Check if already in TTL jail
-//         bool already_banned = false;
-//         for (auto& existing : concept_jail_with_ttl) {
-//             if (existing.word == banned_word) {
-//                 existing.blocks_remaining = 5; // Reset TTL
-//                 already_banned = true;
-//                 break;
-//             }
-//         }
-//         if (!already_banned) {
-//             concept_jail_with_ttl.push_back({banned_word, 5});
-//         }
-//     }
-// }
-
-// void update_ban_list(MultiAgentState& state, const std::string& text, int current_block = 0) {
-//     // 1. Decrement TTL and remove expired bans
-//     for (auto it = concept_jail_with_ttl.begin(); it != concept_jail_with_ttl.end();) {
-//         it->blocks_remaining--;
-//         if (it->blocks_remaining <= 0) {
-//             std::cout << " [CONCEPT JAIL] Unbanning: " << it->word << " (TTL expired)" << std::endl;
-//             it = concept_jail_with_ttl.erase(it);
-//         } else {
-//             ++it;
-//         }
-//     }
-    
-//     // 2. Kavram Tarayıcı (Expanded)
-//     std::string scan = text;
-//     std::transform(scan.begin(), scan.end(), scan.begin(), ::tolower);
-
-//     for(const auto& [cat, words] : global_concepts) {
-//         int hits = 0;
-//         std::vector<std::string> matched_words;
-//         for(const auto& w : words) {
-//             if(scan.find(w) != std::string::npos) {
-//                 hits++;
-//                 matched_words.push_back(w);
-//             }
-//         }
-//         // Eşik: Eğer bir blokta aynı konseptten 2 kelime geçerse, sonraki blokta O KONSEPTİ KOMPLE YASAKLA.
-//         // [UPDATED] With 5-block TTL AND Capitalization
-//         if(hits >= 2) {
-//             std::cout << " [CONCEPT JAIL] Loop Detected in category '" << cat << "'. Locking for 5 blocks." << std::endl;
-//             state.recent_mistakes.push_back("CONCEPT JAIL: Loop Detected in category '" + cat + "'. Locking for 5 blocks.");
-//             // force_concept_lock(cat);
-//         }
-//     }
-    
-//     // 3. Sync TTL jail to state banlist (for use in generate_text)
-//     // Clear old banlist and rebuild from TTL jail
-//     state.recent_vocab_banlist.clear();
-//     for (const auto& term : concept_jail_with_ttl) {
-//         state.recent_vocab_banlist.push_back(term.word);
-//     }
-    
-//     // Listeyi temizle (Hafıza sınırı) - increased
-//     while(concept_jail_with_ttl.size() > 200) concept_jail_with_ttl.pop_front();
-// }
 
 // Forward Declaration
 std::string generate_layer(llama_context* ctx, llama_model* model, const std::string& prompt, int max_tokens, float temp, const std::vector<std::string>& stop_words, const std::deque<std::string>& banned_words = {});
@@ -536,6 +641,168 @@ std::string clean_invalid_utf8(const std::string& input) {
         }
     }
     return output;
+}
+
+static std::string sanitize_world_token(const std::string& input, size_t max_len) {
+    std::string cleaned;
+    cleaned.reserve(std::min(input.size(), max_len));
+    bool last_space = false;
+    for (unsigned char c : input) {
+        if (c < 32 || c == 127) continue; // control chars
+        if (c >= 128) {
+            if (!last_space) cleaned.push_back(' ');
+            last_space = true;
+            continue;
+        }
+        if (std::isspace(c)) {
+            if (!last_space) cleaned.push_back(' ');
+            last_space = true;
+        } else {
+            cleaned.push_back(static_cast<char>(c));
+            last_space = false;
+        }
+        if (cleaned.size() >= max_len) break;
+    }
+
+    while (!cleaned.empty() && std::isspace(static_cast<unsigned char>(cleaned.front()))) cleaned.erase(cleaned.begin());
+    while (!cleaned.empty() && std::isspace(static_cast<unsigned char>(cleaned.back()))) cleaned.pop_back();
+    return cleaned;
+}
+
+static bool is_noisy_world_entry(const std::string& key, const std::string& value) {
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        return s;
+    };
+    std::string lk = lower(key);
+    std::string lv = lower(value);
+
+    if (key.find('[') != std::string::npos || key.find(']') != std::string::npos) return true;
+    if (key.find('<') != std::string::npos || key.find('>') != std::string::npos) return true;
+    if (lk.find("protagonist") != std::string::npos) return true;
+    if (lk.find("data_lost") != std::string::npos || lk.find("redacted") != std::string::npos) return true;
+    if (lk.find("continue_the_story") != std::string::npos || lk.find("end_of_turn") != std::string::npos) return true;
+    if (lk.find("http://") != std::string::npos || lk.find("https://") != std::string::npos) return true;
+    if (lk.size() < 2 || lv.size() < 2) return true;
+    return false;
+}
+
+static std::map<std::string, std::string> sanitize_world_state(const std::map<std::string, std::string>& input) {
+    std::map<std::string, std::string> cleaned;
+    for (const auto& kv : input) {
+        std::string key = sanitize_world_token(kv.first, 96);
+        std::string value = sanitize_world_token(kv.second, 160);
+        if (key.empty() || value.empty()) continue;
+        if (is_noisy_world_entry(key, value)) continue;
+        cleaned[key] = value;
+    }
+    return cleaned;
+}
+
+bool has_dialogue(const std::string& text) {
+    int quote_count = std::count(text.begin(), text.end(), '"');
+    if (quote_count >= 2) return true;
+
+    std::vector<std::string> speech = {
+        "\" it says", "\" she says", "\" he says",
+        "\" it whispers", "\" it asks",
+        "says,", "whispers,", "asks,"
+    };
+
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    for (const auto& s : speech) {
+        std::string needle = s;
+        std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
+        if (lower.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+bool has_pov_break(const std::string& text) {
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    
+    return (lower.find("protagonist") != std::string::npos ||
+            lower.find("their heart") != std::string::npos ||
+            lower.find("their eyes") != std::string::npos ||
+            lower.find("their senses") != std::string::npos);
+}
+
+bool has_internal_repetition(const std::string& text) {
+    const int CHUNK_SIZE = 40;
+    
+    if (text.length() < static_cast<size_t>(CHUNK_SIZE * 2)) return false;
+    
+    for (size_t i = 0; i < text.length() - CHUNK_SIZE; i++) {
+        std::string chunk = text.substr(i, CHUNK_SIZE);
+        size_t second = text.find(chunk, i + CHUNK_SIZE);
+        if (second != std::string::npos) {
+            std::cout << " [INTERNAL REPEAT] '" << chunk.substr(0, 30) << "...'" << std::endl;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Quest-mode detector using semantic similarity (CodeBERT) instead of brittle substring checks.
+bool has_quest_mode(MultiAgentState& state, const std::string& text) {
+    static bool quest_bank_ready = false;
+    static std::vector<Embedding> quest_bank;
+    static std::vector<std::string> quest_seeds = {
+        "find the exit", "follow me now", "you must escape", "we must go", "the door awaits", "take the key", "show the way out"
+    };
+
+    if (state.sensor && !quest_bank_ready) {
+        quest_bank.clear();
+        for (const auto& seed : quest_seeds) {
+            quest_bank.push_back(state.sensor->embed(seed));
+        }
+        quest_bank_ready = !quest_bank.empty();
+    }
+
+    std::string window = text.substr(text.length() > 400 ? text.length() - 400 : 0);
+
+    if (state.sensor && quest_bank_ready) {
+        Embedding sample = state.sensor->embed(window);
+        float max_sim = 0.0f;
+        for (const auto& ref : quest_bank) {
+            max_sim = std::max(max_sim, state.sensor->cosine_similarity(sample, ref));
+        }
+        if (max_sim > 0.70f) {
+            std::cout << " [QUEST] Semantic trigger (sim=" << max_sim << ")" << std::endl;
+            return true;
+        }
+    }
+
+    // Fallback: coarse pattern check if sensor unavailable
+    std::string lower = window;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::vector<std::string> fallback = {"find the", "you must", "we must", "follow me", "come with", "the way out"};
+    for (const auto& pat : fallback) {
+        if (lower.find(pat) != std::string::npos) return true;
+    }
+    return false;
+}
+
+bool has_meta_artifacts(const std::string& text) {
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::vector<std::string> markers = {
+        "<|im_start|>", "<|im_end|>", "<|start_header_id|>", "<|end_header_id|>",
+        "<end_of_turn>", "<begin_of_text>", "<endoftext>", "continue_the_story",
+        "legal terminology:"
+    };
+    for (const auto& m : markers) {
+        if (lower.find(m) != std::string::npos) return true;
+    }
+    return false;
+}
+
+std::string novelty_directive(float novelty_score) {
+    if (novelty_score > 0.4f) return "";
+    if (novelty_score > 0.25f) return "NOVELTY_REQUIRED: shift to a different physical setting (temperature/light/scale) and introduce a new object.";
+    return "NOVELTY_CRITICAL: abandon current motif. Switch sensory channel and alter environment topology immediately.";
 }
 
 // 1. REPETITION CHECKER (Deep Scan)
@@ -636,6 +903,7 @@ bool is_contaminated(const std::string& text) {
         "I need to remind you", "remind you of the directives",
         "rewritten version", "Let's focus on", "I take only action", 
         "You have options", "The story continues", "Good luck", "rewrite",
+        "How would you like", "Would you like to proceed", "What would you like",
         
         // [NEW] Word Salad / Semantic Collapse (Specific Artifacts)
         "gunkleman", "ricotta-washed", "palo verde", "sponge cake",
@@ -651,6 +919,9 @@ bool is_contaminated(const std::string& text) {
         std::transform(lower_p.begin(), lower_p.end(), lower_p.begin(), ::tolower);
         if (lower_text.find(lower_p) != std::string::npos) return true;
     }
+    // Dialogue and meta tokens are considered contamination because they introduce NPC voices or prompt leakage.
+    if (has_dialogue(text)) return true;
+    if (has_meta_artifacts(text)) return true;
     return false;
 }
 
@@ -790,6 +1061,59 @@ std::string strip_meta_commentary(std::string text) {
     return text;
 }
 
+std::string trim_meta_tail(std::string text) {
+    if (text.empty()) return text;
+
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::vector<std::string> markers = {
+        "how would you like", "would you like to proceed", "what would you like",
+        "let me know", "do you want to", "how do you want"
+    };
+
+    size_t cut = std::string::npos;
+    for (const auto& marker : markers) {
+        size_t pos = lower.find(marker);
+        if (pos != std::string::npos) {
+            if (cut == std::string::npos || pos < cut) {
+                cut = pos;
+            }
+        }
+    }
+
+    if (cut != std::string::npos) {
+        text.erase(cut);
+        while (!text.empty() && isspace(text.back())) text.pop_back();
+    }
+
+    return text;
+}
+
+static bool needs_space_between(char left, char right) {
+    unsigned char l = static_cast<unsigned char>(left);
+    unsigned char r = static_cast<unsigned char>(right);
+    if (std::isspace(l) || std::isspace(r)) return false;
+
+    if (right == '"' || right == '\'' || right == '(' || right == '[' || right == '{') {
+        return true;
+    }
+    if (std::ispunct(r)) return false;
+
+    return true;
+}
+
+std::string join_prefill_and_generated(const std::string& prefill, const std::string& generated) {
+    if (prefill.empty()) return generated;
+    if (generated.empty()) return prefill;
+
+    std::string joined = prefill;
+    if (needs_space_between(prefill.back(), generated.front())) {
+        joined.push_back(' ');
+    }
+    joined += generated;
+    return joined;
+}
+
 // --- HELPER: NARRATIVE VALIDATOR ---
 // Returns true if the text passes the HARD CONSTRAINTS (No passive start, no banned words)
 bool is_narrative_valid(const std::string& text) {
@@ -841,11 +1165,11 @@ std::string neural_correct(MultiAgentState& state, const std::string& raw_text) 
 
     // Tokenize
     auto* vocab = llama_model_get_vocab(state.model_main);
-    std::vector<llama_token> tokens_list(formatted_prompt.length() + 128); 
-    int n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+    auto& tokens_list = token_scratch(formatted_prompt.size() + kTokenScratchPad);
+    int n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
     if (n_tokens < 0) {
-         tokens_list.resize(-n_tokens);
-         n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+         token_scratch(static_cast<size_t>(-n_tokens));
+         n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
     }
     tokens_list.resize(n_tokens);
 
@@ -866,7 +1190,8 @@ std::string neural_correct(MultiAgentState& state, const std::string& raw_text) 
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.1f)); 
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(std::rand())); 
 
-    std::string correction = "";
+    std::string correction;
+    correction.reserve(raw_text.size() + 64);
     int max_correction = raw_text.length() + 50; 
     
     for (int i = 0; i < max_correction; i++) {
@@ -919,11 +1244,11 @@ std::string neural_repair(MultiAgentState& state, const std::string& bad_text, c
 
     // Tokenize
     auto* vocab = llama_model_get_vocab(state.model_main);
-    std::vector<llama_token> tokens_list(formatted_prompt.length() + 128); 
-    int n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+    auto& tokens_list = token_scratch(formatted_prompt.size() + kTokenScratchPad);
+    int n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
     if (n_tokens < 0) {
-         tokens_list.resize(-n_tokens);
-         n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+         token_scratch(static_cast<size_t>(-n_tokens));
+         n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
     }
     tokens_list.resize(n_tokens);
 
@@ -940,8 +1265,9 @@ std::string neural_repair(MultiAgentState& state, const std::string& bad_text, c
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.4f)); 
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(std::rand())); 
 
-    std::string repair = "";
+    std::string repair;
     int max_repair = 400; // Allow enough space for rewrite
+    repair.reserve(static_cast<size_t>(max_repair) * kAvgTokenChars);
     
     for (int i = 0; i < max_repair; i++) {
         llama_token new_token_id = llama_sampler_sample(smpl, state.ctx_main, -1);
@@ -1078,28 +1404,159 @@ std::vector<std::string> expand_morphology(const std::string& word) {
     return forms;
 }
 
+std::vector<std::string> split_sentences(const std::string& text) {
+    std::vector<std::string> sentences;
+    std::string current;
+    for (char c : text) {
+        current.push_back(c);
+        if (c == '.' || c == '!' || c == '?') {
+            if (current.length() > 5) {
+                while (!current.empty() && isspace(static_cast<unsigned char>(current.front()))) current.erase(current.begin());
+                while (!current.empty() && isspace(static_cast<unsigned char>(current.back()))) current.pop_back();
+                if (!current.empty()) sentences.push_back(current);
+            }
+            current.clear();
+        }
+    }
+    if (!current.empty()) {
+        while (!current.empty() && isspace(static_cast<unsigned char>(current.front()))) current.erase(current.begin());
+        while (!current.empty() && isspace(static_cast<unsigned char>(current.back()))) current.pop_back();
+        if (!current.empty()) sentences.push_back(current);
+    }
+    return sentences;
+}
+
+std::string dedupe_sentences(const std::string& text) {
+    auto sentences = split_sentences(text);
+    std::set<std::string> seen;
+    std::string rebuilt;
+    for (const auto& s : sentences) {
+        std::string lower = s;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (seen.insert(lower).second) {
+            if (!rebuilt.empty()) rebuilt += " ";
+            rebuilt += s;
+        }
+    }
+    return rebuilt.empty() ? text : rebuilt;
+}
+
+float compute_novelty(MultiAgentState& state, const std::vector<std::string>& sentences) {
+    if (!state.sensor || sentences.empty()) return 1.0f;
+    float min_sim = 1.0f;
+    for (const auto& s : sentences) {
+        Embedding cur = state.sensor->embed(s);
+        float max_sim = 0.0f;
+        for (const auto& prior : state.sentence_memory) {
+            max_sim = std::max(max_sim, state.sensor->cosine_similarity(cur, prior));
+        }
+        min_sim = std::min(min_sim, 1.0f - max_sim);
+    }
+    return min_sim; // Higher is more novel
+}
+
 // --- LLAMA ENGINE ---
 
 // [DYNAMIC MEMORY MANAGEMENT]
 // User requested full control over memory. We will load auxiliary models ON DEMAND.
 // Llama-8B (Main) stays resident. Others (MiroThinker, RWKV, Gemma, Phi, Qwen) are swapped.
 
+static bool file_exists(const std::string& path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+}
+
+static void ensure_directory(const std::string& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        std::filesystem::create_directories(path, ec);
+        if (ec) {
+            std::cerr << "[WARN] Failed to create directory: " << path << " (" << ec.message() << ")" << std::endl;
+        }
+    }
+}
+
+static void log_model_manifest() {
+    struct ModelEntry {
+        const char* name;
+        const std::string* path;
+    };
+
+    const ModelEntry models[] = {
+        {"MAIN", &MODEL_PATH},
+        {"OBSERVER_FIMBULVETR", &FIMBULVETR_PATH},
+        {"SCOUT", &GEMMA_PATH},
+        {"PHI", &PHI_PATH},
+        {"LOGIC", &DEEPSEEK_PATH},
+        {"QWEN_CREATIVE", &QWEN_CREATIVE_PATH},
+        {"QWEN_STABILIZER", &QWEN_STABILIZER_PATH},
+        {"MIROTHINKER", &MIROTHINKER_PATH},
+        {"RWKV", &RWKV_PATH},
+        {"MAMBA", &MAMBA_PATH},
+        {"HERMES", &HERMES_PATH},
+        {"SAUL", &SAUL_PATH},
+        {"CODEBERT_ONNX", &CODEBERT_MODEL_PATH},
+        {"CODEBERT_VOCAB", &VOCAB_PATH}
+    };
+
+    std::cout << "[SYSTEM] Model manifest check:" << std::endl;
+    for (const auto& entry : models) {
+        if (file_exists(*entry.path)) {
+            std::cout << " [MODEL] Ready: " << entry.name << " -> " << *entry.path << std::endl;
+        } else {
+            std::cerr << " [MODEL] Missing: " << entry.name << " -> " << *entry.path << std::endl;
+        }
+    }
+}
+
+static void free_model_and_context(llama_model*& model, llama_context*& ctx) {
+    if (ctx) {
+        llama_free(ctx);
+        ctx = nullptr;
+    }
+    if (model) {
+        llama_model_free(model);
+        model = nullptr;
+    }
+}
+
 void unload_all_aux(MultiAgentState& state) {
-    if (state.model_scout) { llama_free(state.ctx_scout); llama_free_model(state.model_scout); state.model_scout = nullptr; state.ctx_scout = nullptr; }
-    if (state.model_phi) { llama_free(state.ctx_phi); llama_free_model(state.model_phi); state.model_phi = nullptr; state.ctx_phi = nullptr; }
-    if (state.model_qwen_stabilizer) { llama_free(state.ctx_qwen_stabilizer); llama_free_model(state.model_qwen_stabilizer); state.model_qwen_stabilizer = nullptr; state.ctx_qwen_stabilizer = nullptr; }
-    if (state.model_qwen_creative) { llama_free(state.ctx_qwen_creative); llama_free_model(state.model_qwen_creative); state.model_qwen_creative = nullptr; state.ctx_qwen_creative = nullptr; }
-    if (state.model_mirothinker) { llama_free(state.ctx_mirothinker); llama_free_model(state.model_mirothinker); state.model_mirothinker = nullptr; state.ctx_mirothinker = nullptr; }
-    if (state.model_rwkv) { llama_free(state.ctx_rwkv); llama_free_model(state.model_rwkv); state.model_rwkv = nullptr; state.ctx_rwkv = nullptr; }
+    free_model_and_context(state.model_scout, state.ctx_scout);
+    free_model_and_context(state.model_phi, state.ctx_phi);
+    free_model_and_context(state.model_qwen_stabilizer, state.ctx_qwen_stabilizer);
+    free_model_and_context(state.model_qwen_creative, state.ctx_qwen_creative);
+    free_model_and_context(state.model_fimbulvetr, state.ctx_fimbulvetr);
+    free_model_and_context(state.model_mirothinker, state.ctx_mirothinker);
+    free_model_and_context(state.model_rwkv, state.ctx_rwkv);
     
     // [SINGLE SLOT POLICY] Add Mamba and Hermes
-    if (state.model_mamba) { llama_free(state.ctx_mamba); llama_free_model(state.model_mamba); state.model_mamba = nullptr; state.ctx_mamba = nullptr; }
-    if (state.model_hermes) { llama_free(state.ctx_hermes); llama_free_model(state.model_hermes); state.model_hermes = nullptr; state.ctx_hermes = nullptr; }
-    if (state.model_saul) { llama_free(state.ctx_saul); llama_free_model(state.model_saul); state.model_saul = nullptr; state.ctx_saul = nullptr; }
+    free_model_and_context(state.model_mamba, state.ctx_mamba);
+    free_model_and_context(state.model_hermes, state.ctx_hermes);
+    free_model_and_context(state.model_saul, state.ctx_saul);
+    free_model_and_context(state.model_logic, state.ctx_logic);
 }
 
 bool ensure_model_loaded(MultiAgentState& state, llama_model** model_ptr, llama_context** ctx_ptr, const std::string& path, int n_ctx, int n_gpu_layers) {
-    if (*model_ptr != nullptr) return true; // Already loaded
+    if (*model_ptr && *ctx_ptr) {
+        if (llama_n_ctx(*ctx_ptr) == n_ctx) {
+            std::cout << "[MODEL] Reusing: " << path << " (ctx=" << n_ctx << ")" << std::endl;
+            return true; // Already loaded with correct context
+        }
+        std::cout << "[MEMORY] Reloading model with new context size: " << path << std::endl;
+        free_model_and_context(*model_ptr, *ctx_ptr);
+    } else if (*model_ptr || *ctx_ptr) {
+        std::cout << "[MEMORY] Resetting partial model state: " << path << std::endl;
+        free_model_and_context(*model_ptr, *ctx_ptr);
+    }
+
+    static std::set<std::string> missing_models;
+    if (!file_exists(path)) {
+        if (missing_models.insert(path).second) {
+            std::cerr << "[ERR] Model file missing: " << path << std::endl;
+        }
+        return false;
+    }
+    missing_models.erase(path);
 
     std::cout << "[MEMORY] Swapping in model: " << path << "..." << std::endl;
     unload_all_aux(state); // Unload others first! (Single Aux Slot Policy)
@@ -1113,15 +1570,19 @@ bool ensure_model_loaded(MultiAgentState& state, llama_model** model_ptr, llama_
         return false;
     }
 
+    std::cout << "[MODEL] Loaded: " << path << " (gpu_layers=" << n_gpu_layers << ")" << std::endl;
+
     auto cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;
-    cparams.n_batch = 512; // Lower batch for aux
+    cparams.n_batch = std::min(4096, n_ctx);
     *ctx_ptr = llama_init_from_model(*model_ptr, cparams);
     
     if (!*ctx_ptr) {
         std::cerr << "[ERR] Failed to create context for dynamic model." << std::endl;
+        free_model_and_context(*model_ptr, *ctx_ptr);
         return false;
     }
+    std::cout << "[MODEL] Context ready: " << path << " (ctx=" << llama_n_ctx(*ctx_ptr) << ")" << std::endl;
     return true;
 }
 
@@ -1168,8 +1629,16 @@ std::map<std::string, std::string> run_rebel_extraction(const std::string& text)
         std::cerr << " [WARN] Failed to parse REBEL output." << std::endl;
     }
     
+    // [NEW] LLM Fallback if empty
+    if (updates.empty()) {
+        // We can't access 'state' here easily as it's not passed. 
+        // NOTE: run_rebel_extraction signature limits us.
+        // We will execute the LLM fallback IN THE CALLER instead.
+    }
+    
     return updates;
 }
+
 
 // --- WORLD STATE SERIALIZER (JSON -> NARRATIVE) ---
 std::string format_world_state_narrative(const std::map<std::string, std::string>& world_state) {
@@ -1209,42 +1678,73 @@ void prune_world_state(std::map<std::string, std::string>& world_state) {
 
 void init_multi_agent(MultiAgentState& state) {
     llama_backend_init();
+    log_model_manifest();
     
     // --- Llama (Ana Yazar) ---
     auto mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 99; // Metal
-    state.model_main = llama_model_load_from_file("/Users/farukalpay/Desktop/cpp/local_mind/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf", mparams);
+    mparams.n_gpu_layers = GPU_LAYERS_METAL;
+    if (!file_exists(MODEL_PATH)) {
+        std::cerr << "[ERR] Main model file missing: " << MODEL_PATH << std::endl;
+        exit(1);
+    }
+    state.model_main = llama_model_load_from_file(MODEL_PATH.c_str(), mparams);
     if (!state.model_main) {
         std::cerr << "[ERR] Failed to load Main Model!" << std::endl;
         exit(1);
     }
     
     auto cparams_main = llama_context_default_params();
-    cparams_main.n_ctx = 16384; 
-    cparams_main.n_batch = 4096;
+    cparams_main.n_ctx = MAIN_CTX;
+    cparams_main.n_batch = std::min(4096, MAIN_CTX);
     state.ctx_main = llama_init_from_model(state.model_main, cparams_main);
     if (!state.ctx_main) {
         std::cerr << "[ERR] Failed to create Main Context!" << std::endl;
         exit(1);
     }
+    std::cout << "[MODEL] Main ready: " << MODEL_PATH << " (ctx=" << llama_n_ctx(state.ctx_main) << ", gpu_layers=" << GPU_LAYERS_METAL << ")" << std::endl;
 
     // Initialize other pointers to nullptr for dynamic switching
     state.model_scout = nullptr; state.ctx_scout = nullptr;
     state.model_phi = nullptr; state.ctx_phi = nullptr;
     state.model_qwen_stabilizer = nullptr; state.ctx_qwen_stabilizer = nullptr;
     state.model_qwen_creative = nullptr; state.ctx_qwen_creative = nullptr;
+    state.model_fimbulvetr = nullptr; state.ctx_fimbulvetr = nullptr;
     state.model_mirothinker = nullptr; state.ctx_mirothinker = nullptr;
     state.model_rwkv = nullptr; state.ctx_rwkv = nullptr;
     state.model_saul = nullptr; state.ctx_saul = nullptr;
+    state.model_logic = nullptr; state.ctx_logic = nullptr;
     
     // Init Sensors
     std::cout << "[SYSTEM] Initializing CodeBERT Sensor..." << std::endl;
-    state.sensor = std::make_shared<CodeBERT>();
-    state.sensor->load("/Users/farukalpay/Desktop/cpp/local_mind/models/onnx/model_int8.onnx"); 
+    try {
+        if (!file_exists(CODEBERT_MODEL_PATH)) {
+            std::cerr << "[WARN] CodeBERT model missing: " << CODEBERT_MODEL_PATH << std::endl;
+            state.sensor = nullptr;
+        } else {
+            state.sensor = std::make_shared<CodeBERT>();
+            state.sensor->load(CODEBERT_MODEL_PATH);
+            std::cout << "[SYSTEM] CodeBERT Initialized Successfully." << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[ERR] CodeBERT Init Failed: " << e.what() << std::endl;
+        state.sensor = nullptr;
+    } catch (...) {
+        std::cerr << "[ERR] CodeBERT Init Failed (Unknown)." << std::endl;
+        state.sensor = nullptr;
+    }
+    
+    // Init Weather Oracle
+    state.weather_oracle = new WeatherOracle(state.sensor);
 
     // --- DeBERTa (The Judge) ---
     std::cout << "[SYSTEM] Initializing DeBERTa Judge..." << std::endl;
     state.deberta = std::make_shared<DeBERTaNLI>();
+
+    // Reserve hot-path containers to avoid repeated reallocations.
+    state.history_entropy.reserve(16);
+    state.history_sentiment.reserve(16);
+    state.history_speed.reserve(16);
+    state.recent_mistakes.reserve(32);
 }
 
 
@@ -1252,7 +1752,7 @@ void init_multi_agent(MultiAgentState& state) {
 // --- GEMMA SCOUT FUNCTION ---
 std::string gemma_inject_chaos(MultiAgentState& state, const std::string& context) {
     // DYNAMIC LOAD
-    if (!ensure_model_loaded(state, &state.model_scout, &state.ctx_scout, "/Users/farukalpay/Desktop/cpp/local_mind/models/gemma-2-2b-it-Q4_K_M.gguf", 4096, 99)) {
+    if (!ensure_model_loaded(state, &state.model_scout, &state.ctx_scout, GEMMA_PATH, SCOUT_CTX, GPU_LAYERS_METAL)) {
         return context; 
     }
 
@@ -1276,8 +1776,12 @@ std::string gemma_inject_chaos(MultiAgentState& state, const std::string& contex
 
     // --- Gemma Generate (Minimal) ---
     auto* vocab = llama_model_get_vocab(state.model_scout);
-    std::vector<llama_token> tokens_list(prompt.length() + 128); 
-    int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+    auto& tokens_list = token_scratch(prompt.size() + kTokenScratchPad);
+    int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
+    if (n_tokens < 0) {
+        token_scratch(static_cast<size_t>(-n_tokens));
+        n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
+    }
     tokens_list.resize(n_tokens);
 
     // Decode Prompt
@@ -1290,8 +1794,9 @@ std::string gemma_inject_chaos(MultiAgentState& state, const std::string& contex
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.95f)); 
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(std::rand())); 
 
-    std::string chaos_vector = "";
+    std::string chaos_vector;
     int max_tokens = 20; // Slightly more for 3 words
+    chaos_vector.reserve(static_cast<size_t>(max_tokens) * kAvgTokenChars);
     
     for (int i = 0; i < max_tokens; i++) {
         llama_token new_token_id = llama_sampler_sample(smpl, state.ctx_scout, -1);
@@ -1322,7 +1827,7 @@ std::string gemma_inject_chaos(MultiAgentState& state, const std::string& contex
 // --- PHI-2 PATTERN FORENSICS ENGINE ---
 bool phi2_analyze_patterns(MultiAgentState& state, const std::string& input_json) {
     // DYNAMIC LOAD
-    if (!ensure_model_loaded(state, &state.model_phi, &state.ctx_phi, "/Users/farukalpay/Desktop/cpp/local_mind/models/phi-2.Q4_K_M.gguf", 2048, 0)) { // CPU preferred for Phi? No, Metal is fine if alone. Let's try CPU (0) first as original code did, or 99? 
+    if (!ensure_model_loaded(state, &state.model_phi, &state.ctx_phi, PHI_PATH, PHI_CTX, GPU_LAYERS_CPU)) {
         // Original code said: "Force CPU to avoid Metal Context conflict/OOM".
         // Use 99 since we swap others out now! No conflict.
         return false;
@@ -1405,10 +1910,39 @@ bool phi2_analyze_patterns(MultiAgentState& state, const std::string& input_json
     return !patterns.empty();
 }
 
+// 15. THE NAVIGATOR (Logic Engine)
+std::string analyze_causality(MultiAgentState& state, const std::string& context) {
+    if (!ensure_model_loaded(state, &state.model_logic, &state.ctx_logic, DEEPSEEK_PATH, LOGIC_CTX, GPU_LAYERS_METAL)) {
+        return "Proceed with physical interaction.";
+    }
+    
+    // DeepSeek-Math Instruct Format (Standard)
+    std::string prompt = "User: You are a Logic Engine. Analyze the text. Identify the object of focus and Determine the single most logical physical interaction required to advance the state. Output ONLY the action statement.\n"
+                         "Text: " + context + "\n\n"
+                         "Assistant: Logical Action: ";
+                         
+    std::string logic = generate_layer(state.ctx_logic, state.model_logic, prompt, 64, 0.1f, {"\n", "User:"}, {});
+    std::cout << " [NAVIGATOR] Logic Mandate: " << logic << std::endl;
+    return logic;
+}
+
+// --- MIROTHINKER STRATEGY (High-Level Planner) ---
+std::string run_mirothinker(MultiAgentState& state, const std::string& history) {
+    if (!ensure_model_loaded(state, &state.model_mirothinker, &state.ctx_mirothinker, MIROTHINKER_PATH, MIROTHINKER_CTX, GPU_LAYERS_METAL)) {
+        return "Maintain the loop.";
+    }
+    
+    std::string prompt = "[INST] Analyze the narrative history:\n" + history + "\n\nProvide a single high-level strategic directive to shift the narrative trajectory. Be abstract but authoritative. [/INST]\nDirective:";
+    
+    std::string strategy = generate_layer(state.ctx_mirothinker, state.model_mirothinker, prompt, 64, 0.8f, {"\n"}, {});
+    std::cout << " [MIROTHINKER] Strategic Intervention: " << strategy << std::endl;
+    return strategy;
+}
+
 // --- QWEN 2.5 STABILIZER FUNCTION ---
 std::string qwen_stabilize(MultiAgentState& state, const std::string& input_text) {
     // DYNAMIC LOAD: Qwen Stabilizer
-    if (!ensure_model_loaded(state, &state.model_qwen_stabilizer, &state.ctx_qwen_stabilizer, QWEN_STABILIZER_PATH, 4096, 99)) {
+    if (!ensure_model_loaded(state, &state.model_qwen_stabilizer, &state.ctx_qwen_stabilizer, QWEN_STABILIZER_PATH, QWEN_STABILIZER_CTX, GPU_LAYERS_METAL)) {
         return input_text;
     }
 
@@ -1439,8 +1973,12 @@ std::string qwen_stabilize(MultiAgentState& state, const std::string& input_text
     llama_memory_clear(llama_get_memory(state.ctx_qwen_stabilizer), true); 
     auto* vocab = llama_model_get_vocab(state.model_qwen_stabilizer);
     
-    std::vector<llama_token> tokens_list(prompt.length() + 128); 
-    int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+    auto& tokens_list = token_scratch(prompt.size() + kTokenScratchPad);
+    int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
+    if (n_tokens < 0) {
+        token_scratch(static_cast<size_t>(-n_tokens));
+        n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
+    }
     tokens_list.resize(n_tokens);
 
     llama_batch batch = llama_batch_get_one(tokens_list.data(), tokens_list.size());
@@ -1457,8 +1995,9 @@ std::string qwen_stabilize(MultiAgentState& state, const std::string& input_text
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.20f)); // Low temp for stability
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(std::rand()));
     
-    std::string output = "";
+    std::string output;
     int max_toks = 600; 
+    output.reserve(static_cast<size_t>(max_toks) * kAvgTokenChars);
 
     for(int i=0; i<max_toks; i++) {
         llama_token id = llama_sampler_sample(smpl, state.ctx_qwen_stabilizer, -1);
@@ -1494,7 +2033,7 @@ std::string qwen_stabilize(MultiAgentState& state, const std::string& input_text
 // 1. REFLEX FAILURE (Mini Ideation Burst)
 std::string qwen_creative_burst(MultiAgentState& state, const std::string& context) {
     // DYNAMIC LOAD
-    if (!ensure_model_loaded(state, &state.model_qwen_creative, &state.ctx_qwen_creative, QWEN_CREATIVE_PATH, 2048, 99)) {
+    if (!ensure_model_loaded(state, &state.model_qwen_creative, &state.ctx_qwen_creative, QWEN_CREATIVE_PATH, QWEN_CREATIVE_CTX, GPU_LAYERS_METAL)) {
         return "";
     }
     std::cout << " [QWEN 2] Triggering Creative Burst..." << std::endl;
@@ -1518,7 +2057,7 @@ std::string qwen_creative_burst(MultiAgentState& state, const std::string& conte
 // 2. EXISTENTIAL SATURATION (Anlam Çağrışımı)
 std::string qwen_existential_association(MultiAgentState& state, const std::string& narrative) {
     // DYNAMIC LOAD
-    if (!ensure_model_loaded(state, &state.model_qwen_creative, &state.ctx_qwen_creative, QWEN_CREATIVE_PATH, 2048, 99)) {
+    if (!ensure_model_loaded(state, &state.model_qwen_creative, &state.ctx_qwen_creative, QWEN_CREATIVE_PATH, QWEN_CREATIVE_CTX, GPU_LAYERS_METAL)) {
         return "";
     }
     std::cout << " [QWEN 2] Triggering Existential Association..." << std::endl;
@@ -1541,7 +2080,7 @@ std::string qwen_existential_association(MultiAgentState& state, const std::stri
 // 3. CONTROLLED NOISE (Gemma Alternative)
 std::string qwen_creative_concept(MultiAgentState& state) {
     // DYNAMIC LOAD
-    if (!ensure_model_loaded(state, &state.model_qwen_creative, &state.ctx_qwen_creative, QWEN_CREATIVE_PATH, 2048, 99)) {
+    if (!ensure_model_loaded(state, &state.model_qwen_creative, &state.ctx_qwen_creative, QWEN_CREATIVE_PATH, QWEN_CREATIVE_CTX, GPU_LAYERS_METAL)) {
         return "";
     }
     std::cout << " [QWEN 2] Triggering Controlled Noise..." << std::endl;
@@ -1558,6 +2097,59 @@ std::string qwen_creative_concept(MultiAgentState& state) {
 
     std::string out = generate_layer(state.ctx_qwen_creative, state.model_qwen_creative, prompt, 20, 1.0f, {"<|im_end|>", "\n"}, {});
     return trim_trailing_noise(out);
+}
+
+// --- DOLPHIN OBSERVER (Detatched but first-person) ---
+std::string dolphin_observer_reframe(MultiAgentState& state, const std::string& source) {
+    if (!state.model_main || !state.ctx_main) return "";
+    std::string tail = source.substr(source.length() > 700 ? source.length() - 700 : 0);
+
+    std::string prompt = 
+        "<|start_header_id|>system<|end_header_id|>\n"
+        "You are DOLPHIN, a detached observer who narrates what is happening.\n"
+        "Rewrite the provided text as clipped, factual first-person present observations.\n"
+        "Rules: No dialogue. No quests or instructions. Avoid the word 'protagonist'. Keep 3-6 sentences.\n"
+        "<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n"
+        "TEXT: " + tail + "\n"
+        "<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n";
+
+    std::string out = generate_layer(state.ctx_main, state.model_main, prompt, 200, 0.55f, {"<|eot_id|>", "\n\n"}, {});
+    out = strip_meta_commentary(out);
+    out = trim_meta_tail(out);
+    out = trim_trailing_noise(out);
+    return out;
+}
+
+// --- FIMBULVETR OBSERVER (First-Person Enforcer) ---
+std::string fimbulvetr_first_person(MultiAgentState& state, const std::string& source) {
+    if (source.empty()) return "";
+    if (!ensure_model_loaded(state, &state.model_fimbulvetr, &state.ctx_fimbulvetr, FIMBULVETR_PATH, FIMBULVETR_CTX, GPU_LAYERS_METAL)) {
+        return "";
+    }
+
+    std::cout << " [FIMBULVETR] Observing for first-person rewrite..." << std::endl;
+    std::string tail = source.substr(source.length() > 700 ? source.length() - 700 : 0);
+
+    std::string prompt = 
+        "<|im_start|>system\n"
+        "You are FIMBULVETR, a retired observer who EXPERIENCES scenes directly from inside the body.\n"
+        "Rewrite the provided text as an immediate, lived, first-person present-tense account.\n"
+        "Rules: Avoid legal or analytical phrasing. No dialogue. No quests or instructions. Do not name 'protagonist'. Use 'I' naturally. Keep 4-7 sentences focused on sensation and physical surroundings.\n"
+        "Do not add new objects. Keep the sensory intensity and physicality.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "TEXT: " + tail + "\n"
+        "REWRITE:\n"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n";
+
+    std::string out = generate_layer(state.ctx_fimbulvetr, state.model_fimbulvetr, prompt, 200, 0.65f, {"<|im_end|>", "\n\n"}, {});
+    out = strip_meta_commentary(out);
+    out = trim_meta_tail(out);
+    out = trim_trailing_noise(out);
+    return out;
 }
 
 // --- NARRATIVE CIRCUIT BREAKER (State Machine) ---
@@ -1583,81 +2175,228 @@ bool is_toxic_escape_vector(const std::string& vec) {
     return false;
 }
 
-// [SAUL ENGINE] Dynamic Prefill Generator
-// Hardcoded stringleri bitiren fonksiyon budur.
-std::string generate_saul_prefill(MultiAgentState& state, std::string topic) {
-    // Bellek Kontrolü: Saul yüklü değilse yükle (Diğerlerini swap-out yap)
-    // NOT: MODEL_PATH kısmını indirdiğin "models/saul-7b.gguf" olarak güncellemelisin!
-    if (!ensure_model_loaded(state, &state.model_saul, &state.ctx_saul, SAUL_PATH, 2048, 99)) {
-        return "The evidence suggests"; // Model yüklenemezse acil durum fallback'i
+// [SAUL ENGINE] CASE GENERATOR (The Figure)
+// Saul's role: Generate SCENARIOS, not solutions. Create experiences.
+// The Figure creates the case; the Protagonist experiences it.
+std::string generate_saul_case(MultiAgentState& state, const std::string& context) {
+    if (!ensure_model_loaded(state, &state.model_saul, &state.ctx_saul, SAUL_PATH, SAUL_CTX, GPU_LAYERS_METAL)) {
+        return "A sudden change occurs in the environment."; // Fallback case
     }
 
+    std::cout << " [SAUL] The Figure is constructing a case..." << std::endl;
 
-    // Saul'a özel "Hukukçu/Forensic" Prompt - Refined for robustness
+    // Context snippet for Saul
+    std::string short_context = context;
+    if (short_context.length() > 400) {
+        short_context = short_context.substr(short_context.length() - 400);
+    }
+
+    // Saul generates a SCENARIO, not a prefill
     std::string prompt = 
         "### Instruction:\n"
-        "Generate a short, clinical, forensic sentence starter (3-5 words) for the topic: '" + topic + "'.\n"
-        "Rules: No metaphors. No repetition of the topic. Use legal/anatomical terminology.\n"
-        "Example: 'Autopsy reveals significant trauma'\n"
-        "### Response:\n";
+        "You are THE FIGURE - an external force that creates scenarios.\n"
+        "Based on the current situation, generate ONE concrete physical event that HAPPENS NOW.\n"
+        "Rules:\n"
+        "- Write in THIRD PERSON (not 'I', use 'The [object]...')\n"
+        "- Describe WHAT HAPPENS, not what the protagonist feels\n"
+        "- Be specific: sounds, movements, physical changes\n"
+        "- One sentence only. Present tense.\n"
+        "- NO dialogue. NO questions. NO choices.\n\n"
+        "### Current Situation:\n" + short_context + "\n\n"
+        "### The Event:\n";
 
-    // generate_layer fonksiyonunu çağır (Senin kodunda zaten var)
-    std::string out = generate_layer(state.ctx_saul, state.model_saul, prompt, 15, 0.7f, {"\n", ".", "\"", "[", "]", "###", ":"}, {});
+    std::string event = generate_layer(state.ctx_saul, state.model_saul, prompt, 50, 0.8f, {"\n", "###", ".", "?"}, {});
     
-    // Temizlik (Boşlukları vs sil)
-    std::string clean = trim_trailing_noise(out);
-
-    // Fallback: If output is just the topic or empty
-    if (clean.length() < 3 || clean.find(topic) != std::string::npos) {
-        return "The forensic evidence reveals";
+    std::string clean = trim_trailing_noise(event);
+    
+    // Append period if missing
+    if (!clean.empty() && clean.back() != '.') {
+        clean += ".";
     }
+    
+    if (clean.length() < 10) {
+        return "A door slams somewhere in the darkness."; // Fallback
+    }
+    
+    std::cout << " [SAUL] Case Generated: " << clean << std::endl;
     return clean;
 }
 
+// [FIMBULVETR] EXPERIENCE GENERATOR (The Protagonist)
+// Fimbulvetr's role: Take a scenario and EXPERIENCE it in first-person.
+std::string fimbulvetr_experience(MultiAgentState& state, const std::string& scenario, const std::string& context) {
+    if (!ensure_model_loaded(state, &state.model_fimbulvetr, &state.ctx_fimbulvetr, FIMBULVETR_PATH, FIMBULVETR_CTX, GPU_LAYERS_METAL)) {
+        // Fallback: Just prefix with "I" and return
+        return "I " + scenario;
+    }
+
+    std::cout << " [FIMBULVETR] The Protagonist is experiencing..." << std::endl;
+
+    std::string short_context = context;
+    if (short_context.length() > 600) {
+        short_context = short_context.substr(short_context.length() - 600);
+    }
+
+    std::string prompt = 
+        "<|im_start|>system\n"
+        "You are the PROTAGONIST. You experience reality through your senses.\n"
+        "An EVENT has occurred. Describe how YOU experience it.\n"
+        "Rules:\n"
+        "- Write in FIRST PERSON ('I feel...', 'I see...')\n"
+        "- Focus on SENSATIONS: what you see, hear, feel, smell\n"
+        "- NO meta-commentary. NO reflection. Pure experience.\n"
+        "- 2-3 sentences. Present tense.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "Recent context:\n" + short_context + "\n\n"
+        "THE EVENT: " + scenario + "\n\n"
+        "How do you experience this?\n"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        "I ";
+
+    std::string experience = generate_layer(state.ctx_fimbulvetr, state.model_fimbulvetr, prompt, 100, 0.7f, {"<|im_end|>", "\n\n"}, {});
+    
+    std::string result = "I " + trim_trailing_noise(experience);
+    
+    if (result.length() < 15) {
+        return "I feel it before I see it. The air shifts."; // Fallback
+    }
+    
+    std::cout << " [FIMBULVETR] Experience: " << result.substr(0, 80) << "..." << std::endl;
+    return result;
+}
+
+
 // [NEW] CHRONOS: The World Engine
-// Executes python script to predict narrative weather
-std::string run_chronos_forecast(MultiAgentState& state) {
+// Executes python script to predict narrative weather; falls back to on-device classifier if unknown.
+std::string classify_weather_from_text(MultiAgentState& state, const std::string& context) {
+    if (!state.model_main || !state.ctx_main) return "UNKNOWN";
+
+    std::string tail = context.substr(context.length() > 800 ? context.length() - 800 : 0);
+    std::string prompt =
+        "<|start_header_id|>system<|end_header_id|>\n"
+        "You are a concise weather classifier. Given the scene description, pick one label from: CALM, WINDY, STORM, RAIN, FOG, CLEAR.\n"
+        "Respond with ONLY the label.\n"
+        "<|eot_id|>\n"
+        "<|start_header_id|>user<|end_header_id|>\n"
+        "SCENE: " + tail + "\n"
+        "<|eot_id|>\n"
+        "<|start_header_id|>assistant<|end_header_id|>\n";
+
+    std::string out = generate_layer(state.ctx_main, state.model_main, prompt, 8, 0.2f, {"<|eot_id|>", "\n"}, {});
+    std::transform(out.begin(), out.end(), out.begin(), ::toupper);
+    if (out.find("CALM") != std::string::npos) return "CALM";
+    if (out.find("WINDY") != std::string::npos) return "WINDY";
+    if (out.find("STORM") != std::string::npos) return "STORM";
+    if (out.find("RAIN") != std::string::npos) return "RAIN";
+    if (out.find("FOG") != std::string::npos) return "FOG";
+    if (out.find("CLEAR") != std::string::npos) return "CLEAR";
+    return "UNKNOWN";
+}
+
+
+
+// [NEW] LLM Fallback for World State Extraction
+void extract_world_state_llm(MultiAgentState& state, const std::string& text) {
+    if (!state.model_main || !state.ctx_main) return;
+    
+    std::cout << " [REBEL] Python Agent failed. Using LLaMA Fallback..." << std::endl;
+    
+    std::string prompt = 
+        "<|start_header_id|>system<|end_header_id|>\n"
+        "Extract 3 key physical facts about the immediate environment from the text. Format: Entity: Status.\n"
+        "<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n"
+        "TEXT: " + text.substr(text.length() > 600 ? text.length()-600 : 0) + "\n"
+        "<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n";
+        
+    std::string out = generate_layer(state.ctx_main, state.model_main, prompt, 100, 0.5f, {"<|eot_id|>", "\n\n"}, {});
+    
+    // Simple line parsing
+    std::stringstream ss(out);
+    std::string line;
+    while(std::getline(ss, line)) {
+        if (line.find(":") != std::string::npos) {
+            std::string entity = line.substr(0, line.find(":"));
+            std::string status = line.substr(line.find(":") + 1);
+            // Trim
+            while(!entity.empty() && !isalnum(entity.front())) entity.erase(0, 1);
+            while(!status.empty() && isspace(status.front())) status.erase(0, 1);
+            
+            if (entity.length() > 2) {
+                state.world_state[entity] = status;
+                std::cout << " [REBEL-LLM] Update: " << entity << " -> " << status << std::endl;
+            }
+        }
+    }
+}
+
+std::string run_chronos_forecast(MultiAgentState& state, const std::string& recent_text) {
     // 1. Prepare Data
     json j_data;
     j_data["entropy"] = state.history_entropy;
     j_data["sentiment"] = state.history_sentiment;
     j_data["speed"] = state.history_speed;
-    j_data["timestamp"] = (long)std::time(nullptr); // [USER REQ] Real-time sync
+    j_data["timestamp"] = (long)std::time(nullptr); 
     
     std::string valid_json = j_data.dump();
-    
-    // Escape quotes for command line (simplistic)
-    // ideal approach: write to temp file, but command line arg is faster for small data
     std::string cmd = "python3 scripts/chronos_adapter.py '" + valid_json + "'";
     
     // 2. Execute
     std::string result_json;
     FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return "SUNNY";
-    char buffer[128];
-    while (fgets(buffer, 128, pipe) != NULL) {
+    if (!pipe) {
+        state.current_weather = "UNKNOWN";
+        return "";
+    }
+    char buffer[512]; // Increased buffer
+    while (fgets(buffer, 512, pipe) != NULL) {
         result_json += buffer;
     }
     pclose(pipe);
     
-    // 3. Parse
+    // 3. Parse & Predict Vectorially
     try {
         auto j_res = json::parse(result_json);
-        std::string forecast = j_res.value("forecast", "SUNNY");
-        std::string reason = j_res.value("reason", "Unknown");
         
-        std::cout << " [CHRONOS] FORECAST: " << forecast << " (" << reason << ")" << std::endl;
-        
-        if (forecast == "STORM" || forecast == "WINDY") {
-            return "EVENT_INJECTION: A SUDDEN CATASTROPHE OCCURS. " + reason;
+        // Get Metrics
+        float pred_entropy = 0.5f;
+        if (j_res.contains("entropy_pred") && !j_res["entropy_pred"].empty()) {
+            auto& arr = j_res["entropy_pred"];
+            float sum = 0;
+            for(auto& val : arr) sum += val.get<float>();
+            pred_entropy = sum / arr.size();
         }
         
-    } catch (...) {
-        std::cout << " [CHRONOS] Parse Error." << std::endl;
+        // WEATHER SENSOR FUSION (Vector Prediction)
+        if (state.weather_oracle) {
+            std::string vector_weather = state.weather_oracle->predict_next(state.weather_history, pred_entropy, 0.5f);
+            state.current_weather = vector_weather;
+        } else {
+            // Fallback to legacy field
+            state.current_weather = j_res.value("forecast", "UNKNOWN");
+        }
+
+        std::cout << " [CHRONOS] FINAL WEATHER: " << state.current_weather << " (Ent: " << pred_entropy << ")" << std::endl;
+        
+        // Push to history for next time
+        state.weather_history.push_back(state.current_weather);
+        if (state.weather_history.size() > 10) state.weather_history.erase(state.weather_history.begin());
+
+        if (state.current_weather == "STORM" || state.current_weather == "WINDY") {
+             return "EVENT_INJECTION: A SUDDEN CATASTROPHE OCCURS. Weather turns violent.";
+        }
+        
+    } catch (const std::exception& e) {
+        std::cout << " [CHRONOS] Parse Error: " << e.what() << std::endl;
+        state.current_weather = "UNKNOWN";
     }
-    
+
     return "";
 }
+
 
 // [UPDATED] Dynamic Persona Deck
 struct Persona {
@@ -1676,16 +2415,17 @@ void shuffle_deck(MultiAgentState& state) {
     // Her kategori için 3'er tane taze cümle üretiyoruz.
     
     std::vector<std::string> kinetic_dynamic;
-    for(int i=0; i<3; i++) kinetic_dynamic.push_back(generate_saul_prefill(state, "sudden physical impact or force"));
+    for(int i=0; i<3; i++) kinetic_dynamic.push_back(generate_saul_case(state, "sudden physical impact or force"));
 
     std::vector<std::string> visceral_dynamic;
-    for(int i=0; i<3; i++) visceral_dynamic.push_back(generate_saul_prefill(state, "biological trauma or internal anatomy"));
+    for(int i=0; i<3; i++) visceral_dynamic.push_back(generate_saul_case(state, "biological trauma or internal anatomy"));
 
     std::vector<std::string> surreal_dynamic;
-    for(int i=0; i<3; i++) surreal_dynamic.push_back(generate_saul_prefill(state, "visual distortion or hallucination evidence"));
+    for(int i=0; i<3; i++) surreal_dynamic.push_back(generate_saul_case(state, "visual distortion or hallucination evidence"));
 
     std::vector<std::string> observer_dynamic;
-    for(int i=0; i<3; i++) observer_dynamic.push_back(generate_saul_prefill(state, "environmental decay and material structure"));
+    for(int i=0; i<3; i++) observer_dynamic.push_back(generate_saul_case(state, "environmental decay and material structure"));
+
 
     // 2. PERSONA HAVUZUNU OLUŞTUR (Artık Dinamik Veriyle)
     std::vector<Persona> pool = {
@@ -1774,8 +2514,7 @@ bool contains_non_ascii(const std::string& s) {
 RealityShift mirothinker_structural_constraint(MultiAgentState& state, const std::string& context, float severity) {
     RealityShift shift;
     
-    // Safety check for model pointer
-    if (!state.ctx_mirothinker) {
+    if (!ensure_model_loaded(state, &state.model_mirothinker, &state.ctx_mirothinker, MIROTHINKER_PATH, MIROTHINKER_CTX, GPU_LAYERS_METAL)) {
         shift.forced_action = get_diverse_fallback_action();
         return shift;
     }
@@ -1936,7 +2675,7 @@ struct ArcStoryboard {
 // Fast, single-sentence physical intervention to break loops.
 std::string generate_rwkv_veto(MultiAgentState& state, const std::string& history) {
     // DYNAMIC LOAD: RWKV Servo
-    if (!ensure_model_loaded(state, &state.model_rwkv, &state.ctx_rwkv, RWKV_PATH, 2048, 99)) {
+    if (!ensure_model_loaded(state, &state.model_rwkv, &state.ctx_rwkv, RWKV_PATH, RWKV_CTX, GPU_LAYERS_METAL)) {
         return "";
     }
     
@@ -1962,7 +2701,7 @@ std::string generate_rwkv_veto(MultiAgentState& state, const std::string& histor
 // [RWKV] ESCAPE VECTOR (Phase 1 Orthogonal)
 std::string generate_rwkv_escape(MultiAgentState& state, const std::string& history) {
     // DYNAMIC LOAD: RWKV Servo (reusing same model slot)
-    if (!ensure_model_loaded(state, &state.model_rwkv, &state.ctx_rwkv, RWKV_PATH, 2048, 99)) {
+    if (!ensure_model_loaded(state, &state.model_rwkv, &state.ctx_rwkv, RWKV_PATH, RWKV_CTX, GPU_LAYERS_METAL)) {
         return "";
     }
     
@@ -1998,7 +2737,7 @@ NeuralLinkData run_mamba_synapse(MultiAgentState& state, const std::string& rece
     data.state_hash = "0x00";
 
     // Dynamic Load: Mamba 1.4B
-    if (!ensure_model_loaded(state, &state.model_mamba, &state.ctx_mamba, MAMBA_PATH, 2048, 99)) {
+    if (!ensure_model_loaded(state, &state.model_mamba, &state.ctx_mamba, MAMBA_PATH, MAMBA_CTX, GPU_LAYERS_METAL)) {
         std::cerr << " [WARN] Mamba Synapse offline." << std::endl;
         return data; // Fail gracefully
     }
@@ -2029,7 +2768,7 @@ AnchorPack generate_anchor_pack(MultiAgentState& state, const std::string& histo
     AnchorPack pack;
     // DYNAMIC LOAD: MiroThinker
     // This is a heavy 30B model. It will swap out others.
-    if (!ensure_model_loaded(state, &state.model_mirothinker, &state.ctx_mirothinker, "/Users/farukalpay/Desktop/cpp/local_mind/models/MiroThinker-v1.5-30B.Q4_K_M.gguf", 4096, 99)) {
+    if (!ensure_model_loaded(state, &state.model_mirothinker, &state.ctx_mirothinker, MIROTHINKER_PATH, MIROTHINKER_CTX, GPU_LAYERS_METAL)) {
         return pack;
     }
 
@@ -2091,7 +2830,7 @@ AnchorPack generate_anchor_pack(MultiAgentState& state, const std::string& histo
 PhysicsAudit generate_physics_audit(MultiAgentState& state, const std::string& last_block) {
     PhysicsAudit audit;
     // DYNAMIC LOAD
-    if (!ensure_model_loaded(state, &state.model_mirothinker, &state.ctx_mirothinker, "/Users/farukalpay/Desktop/cpp/local_mind/models/MiroThinker-v1.5-30B.Q4_K_M.gguf", 4096, 99)) {
+    if (!ensure_model_loaded(state, &state.model_mirothinker, &state.ctx_mirothinker, MIROTHINKER_PATH, MIROTHINKER_CTX, GPU_LAYERS_METAL)) {
         return audit; 
     }
 
@@ -2124,7 +2863,7 @@ PhysicsAudit generate_physics_audit(MultiAgentState& state, const std::string& l
 ArcStoryboard generate_arc_storyboard(MultiAgentState& state, const std::string& summary) {
     ArcStoryboard arc;
     // DYNAMIC LOAD
-    if (!ensure_model_loaded(state, &state.model_mirothinker, &state.ctx_mirothinker, "/Users/farukalpay/Desktop/cpp/local_mind/models/MiroThinker-v1.5-30B.Q4_K_M.gguf", 4096, 99)) {
+    if (!ensure_model_loaded(state, &state.model_mirothinker, &state.ctx_mirothinker, MIROTHINKER_PATH, MIROTHINKER_CTX, GPU_LAYERS_METAL)) {
         return arc;
     }
 
@@ -2212,8 +2951,12 @@ std::string generate_layer(llama_context* ctx, llama_model* model, const std::st
     llama_memory_clear(llama_get_memory(ctx), true); 
     
     auto* vocab = llama_model_get_vocab(model);
-    std::vector<llama_token> tokens_list(prompt.length() + 128); 
-    int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+    auto& tokens_list = token_scratch(prompt.size() + kTokenScratchPad);
+    int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
+    if (n_tokens < 0) {
+        token_scratch(static_cast<size_t>(-n_tokens));
+        n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
+    }
     tokens_list.resize(n_tokens);
 
     // Decode Prompt
@@ -2226,8 +2969,10 @@ std::string generate_layer(llama_context* ctx, llama_model* model, const std::st
     
     // [LOGIT BIAS] for Banned Words
     std::vector<llama_logit_bias> biases;
+    biases.reserve(banned_words.size());
+    std::vector<llama_token> b_toks;
     for (const auto& w : banned_words) {
-        std::vector<llama_token> b_toks(16);
+        b_toks.resize(w.length() + 4);
         int n = llama_tokenize(vocab, w.c_str(), w.length(), b_toks.data(), b_toks.size(), false, false);
         if (n > 0) biases.push_back({b_toks[0], -1000.0f}); // Token'ı atomik seviyede yasakla
     }
@@ -2239,7 +2984,8 @@ std::string generate_layer(llama_context* ctx, llama_model* model, const std::st
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(std::rand()));
     
-    std::string output = "";
+    std::string output;
+    output.reserve(static_cast<size_t>(max_tokens) * kAvgTokenChars);
     
     for(int i=0; i<max_tokens; i++) {
         llama_token id = llama_sampler_sample(smpl, ctx, -1);
@@ -2281,7 +3027,7 @@ std::vector<std::string> generate_dynamic_constraints(MultiAgentState& state, co
     std::vector<std::string> dynamic_bans;
 
     // DYNAMIC LOAD: Nous-Hermes
-    if (!ensure_model_loaded(state, &state.model_hermes, &state.ctx_hermes, HERMES_PATH, 4096, 99)) {
+    if (!ensure_model_loaded(state, &state.model_hermes, &state.ctx_hermes, HERMES_PATH, HERMES_CTX, GPU_LAYERS_METAL)) {
         std::cerr << " [WARN] Hermes Conscience offline. Using fallback." << std::endl;
         return {"metal", "blood", "void"}; // Minimal fallback
     }
@@ -2325,517 +3071,359 @@ std::vector<std::string> generate_dynamic_constraints(MultiAgentState& state, co
     return dynamic_bans;
 }
 
-std::string generate_composite_narrative(MultiAgentState& state, const std::string& history, const std::string& summary, int domain_idx, std::string directive = "", std::string premonition = "") {
+// [HERMES] POST-GENERATION EDITOR
+// Removes repetitive phrases and clichés from generated text
+std::string hermes_edit_pass(MultiAgentState& state, const std::string& raw_output) {
+    if (raw_output.length() < 100) return raw_output; // Too short to edit
     
-    // 0. EXTRACT DEEP CONTEXT (Grounding)
-    // Sadece son cümleyi değil, son 2000 karakteri al ki sahne kopmasın.
+    if (!ensure_model_loaded(state, &state.model_hermes, &state.ctx_hermes, HERMES_PATH, HERMES_CTX, GPU_LAYERS_METAL)) {
+        return raw_output;
+    }
+    
+    std::cout << " [HERMES] Editing pass..." << std::endl;
+    
+    std::string prompt = 
+        "### Instruction:\n"
+        "You are a prose editor. Your ONLY job is to remove repetitive phrases and improve flow.\n"
+        "DO NOT add new content. DO NOT change the meaning. Only refine what exists.\n"
+        "Remove any sentence that repeats the same imagery as a previous sentence.\n"
+        "Keep first-person perspective. Output ONLY the edited text.\n\n"
+        "### Input:\n" + raw_output + "\n\n"
+        "### Response:\n";
+        
+    std::string edited = generate_layer(state.ctx_hermes, state.model_hermes, prompt, 500, 0.4f, {"###", "\n\n\n"}, {});
+    
+    // Validation: Edited text should be at least 50% of original
+    if (!edited.empty() && edited.length() > raw_output.length() * 0.5) {
+        std::cout << " [HERMES] Edit accepted (Original: " << raw_output.length() << " -> Edited: " << edited.length() << ")" << std::endl;
+        return edited;
+    }
+    
+    return raw_output;
+}
+
+// [FIMBULVETR] POV ENFORCER
+// Uses Fimbulvetr model to naturally rewrite POV if needed
+// NO FORCED FILTERS - if model unavailable, return original text
+std::string fimbulvetr_pov_fix(MultiAgentState& state, const std::string& text) {
+    // Check if POV might be broken
+    bool pov_broken = (text.find("the protagonist") != std::string::npos || 
+                       text.find("The protagonist") != std::string::npos ||
+                       text.find("the character") != std::string::npos ||
+                       text.find("The character") != std::string::npos);
+    
+    if (!pov_broken) return text; // POV OK
+    
+    // If model not available, return original - NO FORCED REPLACEMENT
+    if (!ensure_model_loaded(state, &state.model_fimbulvetr, &state.ctx_fimbulvetr, FIMBULVETR_PATH, FIMBULVETR_CTX, GPU_LAYERS_METAL)) {
+        std::cout << " [FIMBULVETR] Model unavailable. Returning original." << std::endl;
+        return text;
+    }
+    
+    std::cout << " [FIMBULVETR] POV issue detected. Rewriting naturally..." << std::endl;
+    
+    std::string prompt = 
+        "<|im_start|>system\n"
+        "Rewrite this text naturally in first-person perspective.\n"
+        "Make it feel authentic, not mechanical. Preserve the mood and atmosphere.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n" + text + "\n<|im_end|>\n"
+        "<|im_start|>assistant\n";
+        
+    std::string fixed = generate_layer(state.ctx_fimbulvetr, state.model_fimbulvetr, prompt, 500, 0.6f, {"<|im_end|>"}, {});
+    
+    if (!fixed.empty() && fixed.length() > text.length() * 0.5) {
+        std::cout << " [FIMBULVETR] POV rewritten." << std::endl;
+        return fixed;
+    }
+    
+    return text;
+}
+
+
+enum class AuxExpert {
+
+    None,
+    QwenInsight,
+    RWKVGlitch,
+    QwenCreative,
+    MiroThinker
+};
+
+struct AuxRoute {
+    AuxExpert expert = AuxExpert::None;
+    std::string reason;
+};
+
+static std::string to_lower_copy(const std::string& input) {
+    std::string out = input;
+    std::transform(out.begin(), out.end(), out.begin(), ::tolower);
+    return out;
+}
+
+static bool contains_any(const std::string& lower, const std::vector<std::string>& needles) {
+    for (const auto& needle : needles) {
+        if (lower.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static void append_reason(std::string& reason, const std::string& token) {
+    if (reason.empty()) {
+        reason = token;
+    } else {
+        reason += ", " + token;
+    }
+}
+
+AuxRoute route_aux_expert(const std::string& directive, const std::string& recent_history, const std::string& summary, bool has_logic_mandate) {
+    std::string directive_lower = to_lower_copy(directive);
+    std::string summary_lower = to_lower_copy(summary);
+
+    float insight_score = 0.0f;
+    float glitch_score = 0.0f;
+    float creative_score = 0.0f;
+    float miro_score = 0.0f;
+    std::string insight_reason;
+    std::string glitch_reason;
+    std::string creative_reason;
+    std::string miro_reason;
+
+    bool needs_stability = contains_any(directive_lower, {"correction", "ground", "constraint", "stabilize", "veto_action", "system_constraints_updated"});
+    bool needs_chaos = contains_any(directive_lower, {"chaos", "shift", "glitch", "introduce_chaos", "subconscious_shift"});
+    bool needs_logic = has_logic_mandate || contains_any(directive_lower, {"logic", "causal"});
+
+    if (needs_stability) {
+        insight_score += 2.0f;
+        miro_score += 1.0f;
+        append_reason(insight_reason, "stability_directive");
+        append_reason(miro_reason, "stability_directive");
+    }
+    if (needs_chaos) {
+        glitch_score += 1.5f;
+        creative_score += 1.0f;
+        append_reason(glitch_reason, "chaos_directive");
+        append_reason(creative_reason, "chaos_directive");
+    }
+    if (needs_logic) {
+        miro_score += 2.0f;
+        append_reason(miro_reason, "logic_mandate");
+    }
+    if (recent_history.size() < 400) {
+        creative_score += 0.5f;
+        append_reason(creative_reason, "sparse_history");
+    }
+    if (summary_lower.find("void") != std::string::npos) {
+        creative_score += 0.5f;
+        append_reason(creative_reason, "void_summary");
+    }
+
+    AuxRoute route;
+    float best_score = 0.0f;
+    auto consider = [&](AuxExpert expert, float score, const std::string& reason) {
+        if (score > best_score) {
+            best_score = score;
+            route.expert = expert;
+            route.reason = reason;
+        }
+    };
+
+    consider(AuxExpert::MiroThinker, miro_score, miro_reason);
+    consider(AuxExpert::QwenInsight, insight_score, insight_reason);
+    consider(AuxExpert::QwenCreative, creative_score, creative_reason);
+    consider(AuxExpert::RWKVGlitch, glitch_score, glitch_reason);
+
+    if (best_score <= 0.0f) {
+        route.expert = AuxExpert::None;
+        route.reason = "no_signal";
+    }
+
+    return route;
+}
+
+std::string generate_composite_narrative(MultiAgentState& state, const std::string& history, const std::string& summary, int domain_idx, std::string directive = "", std::string premonition = "") {
+    if (!state.model_main || !state.ctx_main) {
+        std::cerr << " [ERR] Main model not initialized for composite generation." << std::endl;
+        return "";
+    }
+
+    // 0. EXTRACT DEEP CONTEXT
     std::string recent_history = "";
     if (history.length() > 2000) {
         recent_history = history.substr(history.length() - 2000);
     } else {
         recent_history = history.empty() ? "The void is silent." : history;
     }
+    
+    std::string last_user_input = "";
+    
+    // --- PHASE 0: MAMBA PREDICTION (Always) ---
+    NeuralLinkData mamba_data = run_mamba_synapse(state, recent_history);
+    std::string mamba_prediction = mamba_data.prediction;
 
-    // Anchor (Son Cümle - Action bağlantısı için)
-    std::string last_sentence = "";
-    size_t last_dot = history.rfind('.');
-    if (last_dot != std::string::npos && last_dot > 150) {
-        last_sentence = history.substr(last_dot + 1);
+    if (!mamba_prediction.empty()) {
+        std::cout << " [SYNAPSE] Prediction: " << mamba_prediction << std::endl;
+    }
+    
+    // --- PHASE 1: LOGIC INJECTION (DeepSeek - ALWAYS) ---
+    // DeepSeek provides the logical mandate for narrative coherence
+    std::string logic_mandate = analyze_causality(state, recent_history);
+
+
+    // --- PHASE 2: MIXTURE-OF-EXPERTS AUX ROUTING ---
+    // Route to at most one auxiliary model per turn (memory-safe).
+    std::string aux_directive = "";
+    std::string aux_source = "";
+
+    AuxRoute aux_route = route_aux_expert(directive, recent_history, summary, !logic_mandate.empty());
+    const char* expert_name = "";
+    switch (aux_route.expert) {
+        case AuxExpert::QwenInsight: expert_name = "QwenInsight"; break;
+        case AuxExpert::RWKVGlitch: expert_name = "RWKVGlitch"; break;
+        case AuxExpert::QwenCreative: expert_name = "QwenCreative"; break;
+        case AuxExpert::MiroThinker: expert_name = "MiroThinker"; break;
+        default: expert_name = "None"; break;
+    }
+    std::cout << " [MOE] Router -> " << expert_name << " (" << aux_route.reason << ")" << std::endl;
+
+    if (aux_route.expert == AuxExpert::QwenInsight) {
+        if (ensure_model_loaded(state, &state.model_qwen_stabilizer, &state.ctx_qwen_stabilizer, QWEN_STABILIZER_PATH, QWEN_STABILIZER_CTX, GPU_LAYERS_METAL)) {
+            std::string prompt = "Context: " + recent_history + "\nProvide a psychological insight about the protagonist's current state.";
+            aux_directive = generate_layer(state.ctx_qwen_stabilizer, state.model_qwen_stabilizer, prompt, 64, 0.7f, {"\n"}, {});
+            aux_source = "INSIGHT (Qwen)";
+            std::cout << " [AUX] Qwen Insight: " << aux_directive << std::endl;
+        }
+    } else if (aux_route.expert == AuxExpert::RWKVGlitch) {
+        if (ensure_model_loaded(state, &state.model_rwkv, &state.ctx_rwkv, RWKV_PATH, RWKV_CTX, GPU_LAYERS_METAL)) {
+            std::string prompt = "Narrative: " + recent_history + "\n\nOutput a short, surreal, glitch-like event that disturbs the reality.";
+            aux_directive = generate_layer(state.ctx_rwkv, state.model_rwkv, prompt, 64, 1.1f, {"\n"}, {});
+            aux_source = "GLITCH (RWKV)";
+            std::cout << " [AUX] RWKV Glitch: " << aux_directive << std::endl;
+        }
+    } else if (aux_route.expert == AuxExpert::QwenCreative) {
+        if (ensure_model_loaded(state, &state.model_qwen_creative, &state.ctx_qwen_creative, QWEN_CREATIVE_PATH, QWEN_CREATIVE_CTX, GPU_LAYERS_METAL)) {
+            std::string prompt = "Context: " + recent_history + "\n\nInvent a totally new, concrete detail to add to the scene.";
+            aux_directive = generate_layer(state.ctx_qwen_creative, state.model_qwen_creative, prompt, 64, 0.9f, {"\n"}, {});
+            aux_source = "BURST (Qwen2)";
+            std::cout << " [AUX] Qwen Creative Burst: " << aux_directive << std::endl;
+        }
+    } else if (aux_route.expert == AuxExpert::MiroThinker) {
+        aux_directive = run_mirothinker(state, recent_history);
+        aux_source = "STRATEGY (MiroThinker)";
+    }
+
+    // --- PHASE 3a: SAUL CASE GENERATION (The Figure Creates) ---
+    std::string saul_case = "";
+    if (rand() % 100 < 80) { // 80% chance - The Figure acts
+        saul_case = generate_saul_case(state, recent_history);
+    }
+
+    // --- PHASE 3b: FIMBULVETR EXPERIENCE (The Protagonist Lives) ---
+    std::string protagonist_experience = "";
+    if (!saul_case.empty()) {
+        protagonist_experience = fimbulvetr_experience(state, saul_case, recent_history);
+    }
+
+
+    // --- PHASE 4: THE MASTER WEAVE (Llama-3-8B) ---
+    // Construct the ultimate prompt
+    std::stringstream prompt_ss;
+    prompt_ss << "<start_of_turn>system\n"
+              << "You are the Core Narrative Engine. Synthesize the inputs into a cohesive narrative block.\n"
+              << "Keep the prose elegant, atmospheric, and forward-moving.\n"
+              << "STRICT: No assistant voice. No questions. No choices. No meta commentary.\n"
+              << "ABSOLUTE RULE: The word 'protagonist' is FORBIDDEN. Write only as 'I'. First person. If you write 'the protagonist', the output is invalid.\n"
+              << "STYLE: First-person present tense. Concrete sensory reality. No dialogue or quoted speech. No quests or instructions.\n";
+    if (domain_idx >= 0 && domain_idx <= 4) {
+        SemanticDomain dom = static_cast<SemanticDomain>(domain_idx);
+        prompt_ss << "DOMAIN: " << get_domain_name(dom) << "\n"
+                  << get_domain_constraint(dom) << "\n";
+    }
+              
+    if (!logic_mandate.empty()) {
+        prompt_ss << "LOGIC MANDATE: " << logic_mandate << "\n";
+    }
+    if (!aux_directive.empty()) {
+        prompt_ss << "EXTERNAL SIGNAL (" << aux_source << "): " << aux_directive << "\n";
+    }
+    if (!premonition.empty()) {
+        prompt_ss << "PREMONITION: " << premonition << "\n";
+    }
+    if (!directive.empty()) {
+        prompt_ss << "DIRECTIVE: " << directive << "\n";
+    }
+    if (!mamba_prediction.empty()) {
+        prompt_ss << "SENSORY FORESHADOW: " << mamba_prediction << "\n";
+    }
+    if (!protagonist_experience.empty()) {
+        prompt_ss << "IMMEDIATE EXPERIENCE (The Protagonist): " << protagonist_experience << "\n";
+    }
+    
+
+
+    prompt_ss << "<end_of_turn><start_of_turn>user\n"
+              << "HISTORY:\n... " << recent_history << "\n\n";
+    
+    if (!protagonist_experience.empty()) {
+        prompt_ss << "The protagonist just experienced: " << saul_case << "\n";
+        prompt_ss << "Continue from their immediate reaction.";
     } else {
-        last_sentence = history.substr(history.length() > 200 ? history.length() - 200 : 0);
+        prompt_ss << "Continue the story.";
+    }
+    
+    prompt_ss << "<end_of_turn><start_of_turn>model\n";
+              
+    // If we have a protagonist experience, use it as the starting point
+    if (!protagonist_experience.empty()) {
+        prompt_ss << protagonist_experience.substr(0, 50); // First 50 chars as seed
     }
 
-    // --- PHASE 1: GEMMA BATCHING (DIRECTIONAL ESCAPE) ---
-    // [UPDATED] Geometric Selection: Find vector furthest from History Centroid
+
+    std::cout << "\n[MASTER WEAVE] Generating with Llama-3..." << std::endl;
+    // Main Llama Generation
+    // Note: ensure_model_loaded for main is usually not needed as it stays resident, 
+    // but if we had to swap it (unlikely for main), we would check. 
+    // Generally state.model_main is always loaded in init.
     
-    std::cout << "\n[PHASE 1] Directional Escape (Geometric Selection)..." << std::endl;
-    std::vector<std::string> options;
-    
-    // 1. Calculate History Centroid (The Gravitational Well)
-    std::vector<float> centroid;
-    if (state.sensor && !state.history_embeddings.empty()) {
-        centroid = state.sensor->compute_centroid(state.history_embeddings);
-        std::cout << " [GEOMETRY] Computed Centroid from " << state.history_embeddings.size() << " blocks." << std::endl;
-    }
-    
-    // 2. Generate Divergent Candidates (High Entropy)
-    // DYNAMIC LOAD: Gemma (Scout)
-    if (!ensure_model_loaded(state, &state.model_scout, &state.ctx_scout, "/Users/farukalpay/Desktop/cpp/local_mind/models/gemma-2-2b-it-Q4_K_M.gguf", 4096, 99)) {
-        std::cerr << " [ERR] Failed to load Gemma for Phase 1!" << std::endl;
-        // Fallback or skip?
+    std::string generated_text = generate_layer(state.ctx_main, state.model_main, prompt_ss.str(), 256, 0.85f, {"<end_of_turn>", "User:", "How would you like", "Let me know"}, {}); // Stop tokens
+
+    // Combine protagonist experience with generated continuation
+    std::string final_block;
+    if (!protagonist_experience.empty()) {
+        final_block = protagonist_experience + " " + generated_text;
     } else {
-    
-    for (int i = 0; i < 5; i++) {
-        std::string p1_prompt; // [FIX] Declaration moved outside scope
-        if (!directive.empty()) {
-             // [OVERRIDE] User Directive Mode
-             p1_prompt = 
-            "<start_of_turn>user\n"
-            "CONTEXT: " + last_sentence + "\n"
-            "TASK: Initialize the scene based on the HIDDEN MOTIVE.\n"
-            "CONSTRAINT: Focus strictly on the motive. Do not deviate.\n"
-            "HIDDEN MOTIVE: " + directive + "\n"
-            "STYLE: Sensory. Direct.\n"
-            "OUTPUT: 1 sentence.\n"
-            "<end_of_turn><start_of_turn>model\n";
-        } else {
-             // [DEFAULT] Drift Mode
-             p1_prompt = 
-            "<start_of_turn>user\n"
-            "CONTEXT: " + last_sentence + "\n"
-            "TASK: Generate a sensory fragment that feels RADICALLY DIFFERENT from the context.\n"
-            "CONSTRAINT: Break continuity. Change the lighting, texture, or physics violently.\n"
-            "HIDDEN MOTIVE: None\n"
-            "STYLE: Disorienting. High Entropy.\n"
-            "OUTPUT: 1 sentence.\n"
-            "<end_of_turn><start_of_turn>model\n";
-        }
-        
-        // High temp for Maximum Divergence
-        std::string angle = generate_layer(state.ctx_scout, state.model_scout, p1_prompt, 60, 1.25f, {"\n"}, {});
-        if (!angle.empty()) {
-            std::string trimmed = trim_trailing_noise(angle);
-            // [CRITICAL] ESCAPE VECTOR REJECTION FILTER
-            // Prevents system prompt collapse
-            if (!is_toxic_escape_vector(trimmed)) {
-                options.push_back(trimmed);
-            } else {
-                std::cout << " [VECTOR REJECTED] Toxic: " << trimmed.substr(0, 40) << "..." << std::endl;
-            }
-        }
-    }
-    } // End else (valid gemma)
-    
-    // [USER REQ] 2.1 ADD RWKV ORTHOGONAL VECTOR
-    // RWKV 7 provides a "Linear Attention" perspective distinct from Transformer attention.
-    std::string rwkv_vec = generate_rwkv_escape(state, recent_history);
-    if (!rwkv_vec.empty()) {
-        std::string trimmed_r = trim_trailing_noise(rwkv_vec);
-        if (!is_toxic_escape_vector(trimmed_r)) {
-            options.push_back(trimmed_r);
-            std::cout << " [VECTOR ADDED] RWKV 7 Orthogonal Candidate." << std::endl;
-        }
+        final_block = generated_text;
     }
 
-    // 3. Selection by Maximum Distance
-    std::string best_vector = "";
-    float max_dist = -1.0f;
     
-    if (state.sensor && !centroid.empty() && !options.empty()) {
-        std::cout << " [VECTORS] Calculating escape trajectories:" << std::endl;
-        for(int i=0; i<options.size(); i++) {
-            std::vector<float> vec = state.sensor->embed(options[i]);
-            float sim = state.sensor->cosine_similarity(vec, centroid);
-            float dist = 1.0f - sim; // Distance is dissimilarity
-            
-            std::cout << "  [" << i << "] Dist: " << dist << " | " << options[i].substr(0, 50) << "..." << std::endl;
-            
-            if (dist > max_dist) {
-                max_dist = dist;
-                best_vector = options[i];
-            }
-        }
-    } else if (!options.empty()) {
-        // Fallback: Random or First if no sensor
-        best_vector = options[0]; 
+    // Basic clean up
+    final_block = strip_meta_commentary(final_block);
+    final_block = trim_meta_tail(final_block);
+    final_block = collapse_repeating_chars(final_block);
+    final_block = trim_trailing_noise(final_block);
+    
+    // --- PHASE 5: HERMES EDIT PASS (80% Chance) ---
+    if (rand() % 100 < 80) {
+        final_block = hermes_edit_pass(state, final_block);
     }
     
-    if (best_vector.empty()) best_vector = "The logic fractures into distinct shards.";
-    std::cout << " [SELECTED ESCAPE VECTOR] " << best_vector << " (Dist: " << max_dist << ")" << std::endl;
-    
-    // 4. Assign to Pipeline Variable
-    // Replaces 'atmosphere' variable from old code
-    std::string atmosphere = best_vector;
-    std::cout << " [Vector Applied]: " << atmosphere << std::endl;
-    
-    // --- PHASE 3: REFLEXIVE ACTION ---
-    std::cout << "[PHASE 3] Generating Reflexive Action..." << std::flush;
-    std::string p2_prompt = 
-        "<|start_header_id|>system<|end_header_id|>\n"
-        "SITUATION: " + atmosphere + "\n"
-        "TASK: Describe the protagonist's INVOLUNTARY physical reaction.\n"
-        "CONSTRAINT: Do NOT use 'I decided' or 'I tried'. Use reflexes (twitch, spasm, gasp, collide, gag).\n"
-        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
-        "I"; 
-    std::string action = generate_layer(state.ctx_main, state.model_main, p2_prompt, 50, 0.6f, {"\n", "."}); 
-    std::cout << " Done." << std::endl;
-
-    // --- PHASE 4: TEXTURE (GEMMA vs QWEN) ---
-    // Condition 3: Controlled Noise Injection (Gemma vs Qwen)
-    std::string texture = "";
-    bool use_qwen_noise = (std::rand() % 100 < 30);
-    
-    // Fallback textures for when models produce meta-commentary
-    auto get_fallback_texture = []() -> std::string {
-        static int idx = 0;
-        std::vector<std::string> fallbacks = {
-            "wet rust, machine oil, copper wires",
-            "cold static, burning plastic, distant thunder",
-            "salt and iron, buzzing fluorescent, damp concrete",
-            "sulfur, rattling chains, peeling wallpaper",
-            "ammonia, grinding gears, cracked tiles"
-        };
-        idx = (idx + 1) % fallbacks.size();
-        return fallbacks[idx];
-    };
-    
-    // Sanitize Gemma output - reject meta-commentary
-    auto sanitize_gemma_texture = [&](const std::string& output) -> std::string {
-        std::string lower = output;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-        
-        // Check for meta-commentary patterns
-        if (lower.find("here are") != std::string::npos ||
-            lower.find("here's") != std::string::npos ||
-            lower.find("options") != std::string::npos ||
-            lower.find("trying to") != std::string::npos ||
-            lower.find("requested") != std::string::npos ||
-            lower.find("aiming for") != std::string::npos ||
-            lower.find("description") != std::string::npos ||
-            lower.find("focusing on") != std::string::npos ||
-            output.length() < 10 ||
-            output.length() > 200) {
-            std::cout << " [GEMMA SANITIZE] Meta-output rejected. Using fallback." << std::endl;
-            return get_fallback_texture();
-        }
-        return output;
-    };
-    
-    if (use_qwen_noise) {
-         // Qwen 2 Creative Concept
-         std::cout << "[PHASE 4] Texture Source: QWEN 2 (Controlled Soft Noise)..." << std::flush;
-         // Qwen function handles dynamic loading now
-         texture = qwen_creative_concept(state);
-    } 
-    
-    // Fallback or Primary: GEMMA (if Qwen not used or returned empty)
-    if (texture.empty()) {
-         // Gemma 2 Chaos
-         std::cout << "[PHASE 4] Texture Source: GEMMA 2 (Biological Chaos)..." << std::flush;
-         
-         // DYNAMIC LOAD: Gemma
-         if (ensure_model_loaded(state, &state.model_scout, &state.ctx_scout, "/Users/farukalpay/Desktop/cpp/local_mind/models/gemma-2-2b-it-Q4_K_M.gguf", 4096, 99)) {
-             std::string p3_prompt = 
-                "<start_of_turn>user\n"
-                "Subject: " + action + "\n"
-                "TASK: Describe the texture/smell/sound of this specific split-second.\n"
-                "STYLE: Biological. Industrial. Disgusting. Cyberpunk.\n"
-                "OUTPUT: 5-10 vivid words. NO EXPLANATIONS. NO 'Here is'.\n"
-                "<end_of_turn><start_of_turn>model\n"; 
-             std::string raw_texture = generate_layer(state.ctx_scout, state.model_scout, p3_prompt, 60, 1.0f, {"\n"});
-             texture = sanitize_gemma_texture(raw_texture);
-         } else {
-             std::cerr << " [ERR] Gemma Failed to Load. Using Fallback Texture." << std::endl;
-             texture = get_fallback_texture();
-         }
-    }
-    std::cout << " Done. [" << texture << "]" << std::endl;
-
-    // --- PHASE 5: PERSONA SELECTION (THE IDIOSYNCRASY ENGINE) ---
-    // Use the Global Persona Deck for variety
-    std::cout << "[PHASE 5] Selecting Persona..." << std::flush;
-    
-    Persona p = draw_persona(state);
-    std::string prefill = pick_random(p.prefills);
-    std::cout << " [" << p.name << "] -> Prefill: '" << prefill << "'..." << std::endl;
-
-    // --- PHASE 6: MASTERING (THE HEAD TRANSPLANT) ---
-    
-    std::string constraint = get_domain_constraint((SemanticDomain)domain_idx);
-    // [STRUCTURAL JAIL APPLICATION]
-    std::string jail_rules = "";
-    if (active_constraints.force_minimal_adjectives) {
-        jail_rules += "CONSTRAINT: STRUCTURAL JAIL ACTIVE [SENSORY OVERLOAD]. MAX 1 ADJECTIVE PER SENTENCE. Use concrete verbs only.\n";
-    }
-    if (active_constraints.ban_metaphors) {
-        jail_rules += "CONSTRAINT: STRUCTURAL JAIL ACTIVE [METAPHOR OVERLOAD]. NO METAPHORS. Describe physical reality only.\n";
-    }
-    if (active_constraints.ban_body_vocab) {
-        jail_rules += "CONSTRAINT: STRUCTURAL JAIL ACTIVE [BODY DISTRESS]. DO NOT MENTION: veins, blood, skin, heart, lungs, breath, pulse. Focus on EXTERNAL objects.\n";
-    }
-    if (active_constraints.ban_abstract_nouns) {
-        jail_rules += "CONSTRAINT: STRUCTURAL JAIL ACTIVE [VOID IMAGERY]. DO NOT MENTION: void, abyss, darkness, silence, empty. Focus on solid matter.\n";
-    }
-
-    // [STRUCTURAL JITTER] - Randomize sentence order to break monotony
-    auto apply_structural_jitter = [](std::string text) -> std::string {
-        if (std::rand() % 100 < 30) { // 30% chance to shuffle sentences
-            std::vector<std::string> sentences;
-            std::stringstream ss(text);
-            std::string segment;
-            while(std::getline(ss, segment, '.')) {
-                if(segment.length() > 3) sentences.push_back(segment + ".");
-            }
-            if (sentences.size() > 2) {
-                std::cout << " [JITTER] Shuffling sentence order for variety." << std::endl;
-                std::shuffle(sentences.begin() + 1, sentences.end(), std::mt19937(std::random_device()()));
-                text = "";
-                for(const auto& s : sentences) text += s;
-            }
-        }
-        return text;
-    };
-
-    // [PHASE 6] MIXER PROMPT (The Conductor)
-    // [UPDATED] Use Natural Language Serializer for World State
-    // std::string world_state_prompt = "";
-    // if (!state.world_state.empty()) {
-    //  world_state_prompt = "[WORLD STATE / KNOWN FACTS]\n";
-    //  for (const auto& pair : state.world_state) {
-    //      world_state_prompt += pair.first + ": " + pair.second + "\n";
-    //  }
-    //  world_state_prompt += "INSTRUCTION: You MUST respect these facts. Do not contradict them.\n";
-    // }
-    
-    std::string world_state_prompt = "";
-    if (!state.world_state.empty()) {
-        world_state_prompt = "[WORLD STATE / MEMORY]\n" + format_world_state_narrative(state.world_state) + 
-                             "INSTRUCTION: Incorporate these details naturally. Do not contradict them.\n";
-    }
-
-    std::string mixer_prompt = 
-        "<|start_header_id|>system<|end_header_id|>\n"
-        "ROLE: You are a New Wave Sci-Fi Author (Style: J.G. Ballard, William Gibson). " + p.instruction + "\n"
-        + constraint + "\n"
-        + jail_rules + "\n"
-        + world_state_prompt +
-        "\n"
-        "STORY CONTEXT (MEMORY): " + summary + "\n"
-        "IMMEDIATE SURROUNDINGS (SCENE): " + recent_history.substr(recent_history.length() > 500 ? recent_history.length()-500 : 0) + "\n"
-        "\n"
-        "MANDATE: " + (directive.empty() ? "None" : "PRIORITY OVERRIDE. Focus primarily on the INTERNAL IMPULSE: " + directive) + "\n"
-        "NEW INPUTS:\n"
-        "- Shift: " + atmosphere + "\n"
-        "- Reflex: I " + action + "\n"
-        "- Sensation: " + texture + "\n"
-        "- NERVOUS SYSTEM PREMONITION (INSTINCT): " + (premonition.empty() ? "Unclear" : premonition) + "\n"
-        "INSTRUCTION: Incorporate the 'Premonition' subtly. The character feels this is about to happen.\n"
-        "- INTERNAL IMPULSE: " + (directive.empty() ? "None" : directive) + "\n"
-        "- Subconscious Spark: " + ((directive == "CONTINUE" && std::rand() % 100 < 20) ? qwen_creative_burst(state, recent_history) : "None") + "\n" // Cond 1
-        "- Human Association: " + (std::rand() % 100 < 25 ? qwen_existential_association(state, recent_history) : "None") + "\n" // Cond 2
-        "\n"
-        "STRICT RULES:\n"
-        "1. START EXACTLY with: '" + prefill + "'.\n"
-        "2. SHOW, DON'T TELL. Don't say 'I felt afraid'. Describe the cold sweat.\n"
-        "3. NO LOGIC. Do not explain WHY. Focus on the SENSORY INPUT.\n"
-        "4. SENTENCE VARIETY. Use fragments. Break the grammar rules if needed for impact.\n"
-        "5. LENGTH: Write a dense, immersive paragraph (approx 200 words). Do NOT be brief.\n"
-        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
-        "" + prefill; // FORCE THE START
-
-    // RETRY LOOP
-    std::string final_block = "";
-    int attempts = 0;
-    std::vector<std::string> banned_words; // [FIX] Declaration added
-    
-    // [UPDATED] Anti-Repetition Logic: Frequency Penalty from History
-    // Scan recent history (last 2000 chars) for frequent words and soft-ban them.
-    if (!history.empty()) {
-        std::map<std::string, int> freq_map;
-        std::string recent_hist = history.substr(history.length() > 2500 ? history.length()-2500 : 0);
-        std::transform(recent_hist.begin(), recent_hist.end(), recent_hist.begin(), ::tolower);
-        
-        std::stringstream ss(recent_hist);
-        std::string word;
-        while (ss >> word) {
-            // Basic cleanup
-            word.erase(std::remove_if(word.begin(), word.end(), [](char c){ return !isalnum(c); }), word.end());
-            if (word.length() > 4) { // Only track significant words
-                freq_map[word]++;
-            }
-        }
-        
-        // Ban words that appear > 3 times in recent context
-        for (const auto& [w, count] : freq_map) {
-            // Whitelist common structural words
-            if (w == "with" || w == "from" || w == "that" || w == "this" || 
-                w == "they" || w == "their" || w == "there" || w == "into" || w == "through") continue;
-                
-            if (count > 3) {
-                // Add to transient ban list for this generation
-                banned_words.push_back(w);
-                
-                // Capitalized version too
-                std::string cap = w; 
-                cap[0] = toupper(cap[0]);
-                banned_words.push_back(cap);
-                
-                // Log critical repeats
-                if (count > 5) {
-                   std::cout << " [ANTI-REPEAT] Transient Ban: " << w << " (Count: " << count << ")" << std::endl;
-                }
-            }
-        }
-    }
-
-    // [UPDATED] Anti-Cliche Logic (User Request 5)
-    if (state.ctx_main) {
-       // "fingernails", "bone", "ozone", "metallic" - if recently used.
-       // Check if prompt contains them? Or just hard ban them if they were used in the *previous* output (context).
-       std::vector<std::string> cliches = {"fingernails", "bone", "ozone", "metallic", "slide", "pulsating", "viscous", "shards"};
-       for (const auto& word : cliches) {
-           if (history.find(word) != std::string::npos) {
-               // Add to banned words for THIS generation
-               banned_words.push_back(word);
-               // Also capitalize
-               std::string cap = word; cap[0] = toupper(cap[0]);
-               banned_words.push_back(cap);
-               std::cout << " [CLICHE BLOCK] Banned recently used cliche: " << word << std::endl;
-               state.recent_mistakes.push_back("CLICHE BLOCK: Banned " + word);
-           }
-       }
-    }
-
-    while (attempts < 3) {
-        attempts++;
-        // Stop word EOT. \n yok, paragrafı bitirmesine izin ver.
-        // [UPDATED] Pass dynamic ban list
-        std::deque<std::string> effective_bans = state.recent_vocab_banlist; // Copy global
-        for(const auto& w : banned_words) effective_bans.push_back(w); // Add local cliches
-
-        std::string generated_body = generate_layer(state.ctx_main, state.model_main, mixer_prompt, 800, p.temp, {"<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>"}, effective_bans);
-        
-        // *** CRITICAL FIX: KAFAYI GÖVDEYE DİKME İŞLEMİ ***
-        // "green goo" hatasının ilacı bu satırdır. Prefill'i geri ekliyoruz.
-        std::string body_clean = strip_meta_commentary(generated_body);
-        if (!prefill.empty() && !body_clean.empty() && prefill.back() != ' ' && body_clean.front() != ' ' && body_clean.front() != '.') {
-            final_block = prefill + " " + body_clean;
-        } else {
-            final_block = prefill + body_clean;
-        }
-
-        // [USER REQ] CRITICAL FIX: POST-GENERATION HARD REJECT FOR CLICHES
-        // Logit bias is not enough for multi-token words (e.g. "metallic"). We must check unconditionally.
-        bool found_cliche = false;
-        std::string lower_final = final_block;
-        std::transform(lower_final.begin(), lower_final.end(), lower_final.begin(), ::tolower);
-        
-        for (const auto& banned : state.recent_vocab_banlist) {
-            std::string lower_banned = banned;
-            std::transform(lower_banned.begin(), lower_banned.end(), lower_banned.begin(), ::tolower);
-            if (!lower_banned.empty() && lower_final.find(lower_banned) != std::string::npos) {
-                std::cout << " [HARD REJECT] Found banned word: '" << banned << "' in output. Retrying..." << std::endl;
-                state.recent_mistakes.push_back("HARD REJECT: Found '" + banned + "'");
-                
-                // [FIX] Force Replace if this is the last attempt
-                if (attempts >= 2) { 
-                     std::cout << " [HARD REJECT] FATAL: Failed to clear banned word. Redacting..." << std::endl;
-                     size_t pos = lower_final.find(lower_banned);
-                     while(pos != std::string::npos) {
-                         // Find word boundaries
-                         size_t start = pos;
-                         while (start > 0 && isalpha(lower_final[start-1])) start--;
-                         size_t end = pos + banned.length();
-                         while (end < lower_final.length() && isalpha(lower_final[end])) end++;
-                         
-                         size_t len = end - start;
-                         final_block.replace(start, len, "[REDACTED]");
-                         lower_final.replace(start, len, "[REDACTED]"); // Update search string
-                         
-                         pos = lower_final.find(lower_banned, start + 10);
-                     }
-                } else {
-                    found_cliche = true;
-                    break; // Stop checking other words, just retry
-                }
-            }
-        }
-        
-        if (found_cliche) {
-            continue; // Retry loop immediately
-        }
-
-        // Validasyon: Model "I felt" diyerek kolaya kaçarsa reddet.
-        bool bad_style = false;
-        std::string lower_check = final_block;
-        std::transform(lower_check.begin(), lower_check.end(), lower_check.begin(), ::tolower);
-        
-        if (lower_check.find("i felt") != std::string::npos) bad_style = true;
-        if (lower_check.find("it seemed") != std::string::npos) bad_style = true;
-        
-        if (final_block.length() > 300 && !bad_style) {
-            break; 
-        }
-        if (bad_style) {
-            std::cout << " [RETRY " << attempts << "] Caught 'filter word' (felt/seemed)." << std::endl;
-            state.recent_mistakes.push_back("RETRY " + std::to_string(attempts) + ": Caught filter word (felt/seemed)");
-        }
-        if (final_block.length() <= 300) {
-            std::cout << " [RETRY " << attempts << "] Too short (" << final_block.length() << " chars)." << std::endl;
-            state.recent_mistakes.push_back("RETRY " + std::to_string(attempts) + ": Too short (" + std::to_string(final_block.length()) + " chars)");
-        }
-
-    }
-    
-    // Safety: Hala "As I" ile başlıyorsa (prefill'e rağmen) kes.
-    if (final_block.rfind("As I ", 0) == 0) {
-         final_block.replace(0, 5, "I ");
-    }
-
-    // --- PHASE 7: REFLEXIVE CHECK (CodeBERT) ---
-    // User Requirement: Check embedding. If REPEAT -> Trigger Phi-2 -> Restart with Directive.
-    // Since we are at the end of the function, we can't easily restart *inside* without wrapping the whole function body.
-    // Instead, we will return a SPECIAL SIGNAL or just handle it here in a loop if I refactor.
-    // Refactoring the whole function to be inside a loop is safest.
-    
-    // --- PHASE 7: QWEN STABILIZER INTEGRATION ---
-    // User Spec: Trigger if similarity > 0.85 or risk detected.
-    
-    // [UPDATE] Apply Structural Jitter Re-ordering
-    final_block = apply_structural_jitter(final_block);
-
-    // 1. Calculate Risk (Similarity)
-    float current_risk = 0.0f;
-    if (state.sensor && !state.history_embeddings.empty()) {
-        std::vector<float> current_embed = state.sensor->embed(final_block);
-        for (const auto& h : state.history_embeddings) {
-           float s = state.sensor->cosine_similarity(current_embed, h);
-           if (s > current_risk) current_risk = s;
-        }
-    }
-    
-    // 2. Check Concept Jail Triggers (Simplified scan)
-    bool jail_risk = false;
-    std::string lower_blk = final_block;
-    std::transform(lower_blk.begin(), lower_blk.end(), lower_blk.begin(), ::tolower);
-    // Hardcoded check for known offenders to be safe
-    if(lower_blk.find("metal") != std::string::npos || lower_blk.find("blood") != std::string::npos || lower_blk.find("ozone") != std::string::npos) {
-        jail_risk = true;
-    }
-
-    if (current_risk > 0.85 || jail_risk) {
-        std::cout << "[STABILIZER] Triggering Qwen (Risk: " << current_risk << ", Jail: " << jail_risk << ")..." << std::endl;
-        final_block = qwen_stabilize(state, final_block);
-    } // Else maintain raw chaos
+    // --- PHASE 6: FIMBULVETR POV FIX (If needed) ---
+    final_block = fimbulvetr_pov_fix(state, final_block);
 
     return final_block;
 }
 
+
 // WRAPPER FOR REFLEX LOOP
 std::string generate_composite_narrative_with_reflex(MultiAgentState& state, const std::string& history, const std::string& summary) {
     int attempts = 0;
-    std::string directive = "";
-    
-    while(attempts < 3) {
-        // CALL CORE GENERATION (We need to pass directive to it. Modifying signature of generate_composite_narrative needed?)
-        // Yes. Let's modify the signature above or copy logic. 
-        // Modifying signature is cleaner.
-        // But for now, let's just use a global or a member in state? No, thread safety.
-        // Let's modify generate_composite_narrative to take 'directive'.
-        // Wait, I can't modify the signature in this chunk easily without changing the function definition line which is far away.
-        // Actually, line 831 is generate_composite_narrative.
-        // I will overload it or just copy the logic? No, copying is bad.
-        // I will change the signature of generate_composite_narrative in a separate chunk to accept `std::string directive = ""` 
-        
-        // Assuming I changed the signature:
-        // std::string block = generate_composite_narrative_internal(state, history, summary, directive);
-        
-        // For now, since I can't easily change the signature in *this* tool call without touching line 831 (which is consistent),
-        // I will assume the 'generate_composite_narrative' I see in the file (lines 831-1008) is the one to use.
-        // I will rename the *existing* function to `generate_composite_narrative_internal` in a separate chunk, and add `directive` arg.
-        // Then this wrapper becomes the public `generate_composite_narrative`.
-        
-        return "Temp"; // Placeholder for logic I'll implement in the next step properly.
+    std::string directive;
+
+    while (attempts < 3) {
+        std::string block = generate_composite_narrative(state, history, summary, state.domain_index, directive);
+        if (!block.empty()) return block;
+        directive = "SYSTEM_CONSTRAINTS_UPDATED";
+        attempts++;
     }
     return "";
 }
@@ -2855,7 +3443,7 @@ std::string generate_text(MultiAgentState& state, const std::string& prompt, int
     if (!state.model_main || !state.ctx_main) return " [Error: LLaMA not initialized]";
 
     // Cliché Killer: Always ban these
-    std::vector<std::string> cliche_words = {
+    static const std::vector<std::string> kClicheWords = {
         "pulsating", "resonating", "shroud", "labyrinth", "tapestry", "orb", "cacophony", "kaleidoscope",
         "embers", "burning", "hiss", "shiver", "spine", "echoes", "abyss", "crimson", "azure",
         "metal", "metallic", "iron", "copper", "rust", // [UPDATED] Manual Concept Jail
@@ -2985,9 +3573,12 @@ std::string generate_text(MultiAgentState& state, const std::string& prompt, int
             std::cout << " [CONCEPT BAN] Suppressing '" << concept << "' (" << hits << " hits)" << std::flush;
              // Only ban if strictly needed.
              // Adding to active bans.
-             active_concept_bans.insert(active_concept_bans.end(), keywords.begin(), keywords.end());
+            active_concept_bans.insert(active_concept_bans.end(), keywords.begin(), keywords.end());
         }
     }
+    // POV safety: discourage third-person lead-ins without hard replacement
+    active_concept_bans.push_back("protagonist");
+    active_concept_bans.push_back("protagonist's");
 
 
     // 5. PROMPT ASSEMBLY (Leak-Proof)
@@ -3000,12 +3591,12 @@ std::string generate_text(MultiAgentState& state, const std::string& prompt, int
 
     // Tokenize
     auto* vocab = llama_model_get_vocab(state.model_main);
-    std::vector<llama_token> tokens_list(formatted_prompt.length() + 128); // allocate buffer
-    int n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.length(), tokens_list.data(), tokens_list.size(), true, true); // add_bos=true
+    auto& tokens_list = token_scratch(formatted_prompt.size() + kTokenScratchPad); // allocate buffer
+    int n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.size(), tokens_list.data(), tokens_list.size(), true, true); // add_bos=true
     if (n_tokens < 0) {
          // resize and retry if needed, but usually enough
-         tokens_list.resize(-n_tokens);
-         n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+         token_scratch(static_cast<size_t>(-n_tokens));
+         n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
     }
     tokens_list.resize(n_tokens);
 
@@ -3027,6 +3618,7 @@ std::string generate_text(MultiAgentState& state, const std::string& prompt, int
     
     // 1. Prepare Biases Vector
     std::vector<llama_logit_bias> biases;
+    biases.reserve(masked_tokens.size() + kClicheWords.size() + banned_words.size() + active_concept_bans.size() + 2);
 
     // A. Add "Hard" Masked Tokens (from earlier logic)
     for (llama_token token_id : masked_tokens) {
@@ -3034,18 +3626,20 @@ std::string generate_text(MultiAgentState& state, const std::string& prompt, int
     }
 
     // B. Convert all banned strings (Cliches, Concept Bans) to tokens
-    std::vector<std::string> all_bans = cliche_words;
-    all_bans.insert(all_bans.end(), banned_words.begin(), banned_words.end());
-    all_bans.insert(all_bans.end(), active_concept_bans.begin(), active_concept_bans.end());
-    
-    for (const auto& w : all_bans) {
-        std::vector<llama_token> b_tokens(w.length() + 4); 
-        int n_bt = llama_tokenize(vocab, w.c_str(), w.length(), b_tokens.data(), b_tokens.size(), false, false); 
-        if (n_bt > 0) {
-            // Ban start token
-            biases.push_back({b_tokens[0], -1000.0f}); 
+    std::vector<llama_token> b_tokens;
+    auto add_biases = [&](const std::vector<std::string>& words) {
+        for (const auto& w : words) {
+            b_tokens.resize(w.length() + 4);
+            int n_bt = llama_tokenize(vocab, w.c_str(), w.length(), b_tokens.data(), b_tokens.size(), false, false); 
+            if (n_bt > 0) {
+                // Ban start token
+                biases.push_back({b_tokens[0], -1000.0f}); 
+            }
         }
-    }
+    };
+    add_biases(kClicheWords);
+    add_biases(banned_words);
+    add_biases(active_concept_bans);
     
     // C. Add Header Bans (System tokens)
     biases.push_back({128006, -100.0f}); // <|start_header_id|>
@@ -3069,6 +3663,7 @@ std::string generate_text(MultiAgentState& state, const std::string& prompt, int
 
     // --- GENERATION LOOP ---
     std::string result = assistant_prefill; 
+    result.reserve(static_cast<size_t>(max_tokens) * kAvgTokenChars + assistant_prefill.size() + 16);
     std::cout << result << std::flush;      
 
     // int max_tokens = 400; // Replaced by parameter
@@ -3204,17 +3799,17 @@ std::string generate_summary(MultiAgentState& state, const std::string& history)
         "<|start_header_id|>user<|end_header_id|>\n\n" 
         "NARRATIVE HISTORY:\n" + history + "\n\n" 
         "Summarize this arc in 3 sentences."
-        "<|eot_header_id|>"
+        "<|eot_id|>"
         "<|start_header_id|>assistant<|end_header_id|>\n\n"
         "The protagonist"; // Pre-fill to enforce 3rd person
 
     // Tokenize
     auto* vocab = llama_model_get_vocab(state.model_main);
-    std::vector<llama_token> tokens_list(formatted_prompt.length() + 128); 
-    int n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+    auto& tokens_list = token_scratch(formatted_prompt.size() + kTokenScratchPad);
+    int n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
     if (n_tokens < 0) {
-         tokens_list.resize(-n_tokens);
-         n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.length(), tokens_list.data(), tokens_list.size(), true, true);
+         token_scratch(static_cast<size_t>(-n_tokens));
+         n_tokens = llama_tokenize(vocab, formatted_prompt.c_str(), formatted_prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
     }
     tokens_list.resize(n_tokens);
 
@@ -3237,10 +3832,10 @@ std::string generate_summary(MultiAgentState& state, const std::string& history)
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.4f)); // Low temp for facts
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(std::rand())); // [FIXED] Added Distribution Sampler to prevent crash
     
-    std::string result = "The protagonist"; 
-    std::cout << result << std::flush;      
-
     int max_tokens = 150; 
+    std::string result = "The protagonist"; 
+    result.reserve(static_cast<size_t>(max_tokens) * kAvgTokenChars + 32);
+    std::cout << result << std::flush;      
     
     for (int i = 0; i < max_tokens; i++) {
         llama_token new_token_id = llama_sampler_sample(smpl, state.ctx_main, -1);
@@ -3268,7 +3863,8 @@ std::string generate_summary(MultiAgentState& state, const std::string& history)
 
 // --- NETWORK OPS ---
 std::vector<std::string> fetch_data_from_tx(const std::string& txid) {
-    if (txid == "GENESIS_TX") return {"GENESIS", "", "", "[]", "{}"};
+    if (txid == "GENESIS_TX") return {"GENESIS", "", "", "[]", "{}", "UNKNOWN"};
+
 
     // [UPDATED] 1. CHECK LOCAL CACHE FIRST (Trust Engine)
     std::string cache_path = "cache/" + txid + ".json";
@@ -3281,17 +3877,30 @@ std::vector<std::string> fetch_data_from_tx(const std::string& txid) {
         try {
             auto j = json::parse(raw);
             std::string mistakes_str = "[]";
-            if(j.contains("mistakes_log")) mistakes_str = j["mistakes_log"].dump();
+            if (j.contains("mistakes_log")) mistakes_str = j["mistakes_log"].dump();
+            else if (j.contains("mistakes_rag")) mistakes_str = j["mistakes_rag"].dump();
             std::string world_str = "{}";
-            if(j.contains("world_state")) world_str = j["world_state"].dump();
-            return {j.value("parent_tx", ""), j.value("content", ""), j.value("depth", "0"), mistakes_str, world_str};
+            if (j.contains("world_state")) world_str = j["world_state"].dump();
+            std::string depth_str = "0";
+            if (j.contains("depth")) {
+                if (j["depth"].is_number_integer()) depth_str = std::to_string(j["depth"].get<int>());
+                else if (j["depth"].is_number()) depth_str = std::to_string(j["depth"].get<double>());
+                else if (j["depth"].is_string()) depth_str = j["depth"].get<std::string>();
+            }
+            std::string weather_str = "UNKNOWN";
+            if (j.contains("chronos") && j["chronos"].contains("weather")) {
+                weather_str = j["chronos"]["weather"].get<std::string>();
+            }
+            return {j.value("parent_tx", ""), j.value("content", ""), depth_str, mistakes_str, world_str, weather_str};
+
         } catch (...) {
             std::cerr << " [ERR] Corrupt cache for " << txid << std::endl;
         }
     }
 
     // 2. NETWORK VERIFICATION (Fallback)
-    if (txid == "GENESIS") return {"", "GENESIS BLOCK", "0", "[]", "{}"};
+    if (txid == "GENESIS") return {"", "GENESIS BLOCK", "0", "[]", "{}", "UNKNOWN"};
+
 
     // Use absolute path
     std::string cmd = "python3 /Users/farukalpay/Desktop/cpp/local_mind/scripts/uploader.py --fetch=\"" + txid + "\" 2>/dev/null";
@@ -3331,18 +3940,31 @@ std::vector<std::string> fetch_data_from_tx(const std::string& txid) {
         auto j = json::parse(clean_invalid_utf8(data));
         std::string p = j.value("parent_tx", "");
         std::string c = j.value("content", "");
-        std::string d = j.value("depth", "0");
+        std::string d = "0";
+        if (j.contains("depth")) {
+            if (j["depth"].is_number_integer()) d = std::to_string(j["depth"].get<int>());
+            else if (j["depth"].is_number()) d = std::to_string(j["depth"].get<double>());
+            else if (j["depth"].is_string()) d = j["depth"].get<std::string>();
+        }
         std::string mistakes_str = "[]";
-        if(j.contains("mistakes_log")) mistakes_str = j["mistakes_log"].dump();
+        if (j.contains("mistakes_log")) mistakes_str = j["mistakes_log"].dump();
+        else if (j.contains("mistakes_rag")) mistakes_str = j["mistakes_rag"].dump();
         std::string world_str = "{}";
-        if(j.contains("world_state")) world_str = j["world_state"].dump();
-        return {p, c, d, mistakes_str, world_str};
+        if (j.contains("world_state")) world_str = j["world_state"].dump();
+
+        std::string weather_str = "UNKNOWN";
+        if (j.contains("chronos") && j["chronos"].contains("weather")) {
+            weather_str = j["chronos"]["weather"].get<std::string>();
+        }
+        return {p, c, d, mistakes_str, world_str, weather_str};
+
     } catch (...) {
         return {};
     }
 }
 
-std::vector<std::string> reconstruct_narrative(const std::string& head_tx, int max_depth) {
+std::vector<std::string> reconstruct_narrative(MultiAgentState& state, const std::string& head_tx, int max_depth) {
+
     std::vector<std::string> narrative;
     std::string current_tx = head_tx;
 
@@ -3358,13 +3980,18 @@ std::vector<std::string> reconstruct_narrative(const std::string& head_tx, int m
         }
 
         if (!data[1].empty()) narrative.push_back(data[1]);
+        if (data.size() > 5 && !data[5].empty()) state.weather_history.push_back(data[5]);
+        
         current_tx = data[0]; 
     }
 
     std::reverse(narrative.begin(), narrative.end());
+    std::reverse(state.weather_history.begin(), state.weather_history.end());
+    
     std::cout << "\n[VERIFY] Chain Reconstructed: " << narrative.size() << " blocks." << std::endl;
     return narrative;
 }
+
 
 // --- NEURAL TRACE (Local JSON Map) ---
 void update_neural_map(const std::string& txid, const json& private_data) {
@@ -3421,7 +4048,7 @@ int main(int argc, char* argv[]) {
     shuffle_deck(state); // [UPDATED] Init Persona Deck with Saul
 
     // ENSURE CACHE DIR
-    system("mkdir -p cache");
+    ensure_directory("cache");
 
     // PARENT RESOLUTION
     std::string parent_tx = "GENESIS_TX"; 
@@ -3462,12 +4089,20 @@ int main(int argc, char* argv[]) {
 
     std::string full_context = "";
     std::vector<std::string> history;
+    int chain_depth = 0;
 
     // CONTEXT LOADING
     if (parent_tx != "GENESIS_TX") {
-        history = reconstruct_narrative(parent_tx, MAX_DEPTH);
+        history = reconstruct_narrative(state, parent_tx, MAX_DEPTH);
         for (const auto& block : history) {
+
             full_context += block + " ";
+        }
+        chain_depth = static_cast<int>(history.size());
+        
+        if (!state.weather_history.empty()) {
+            state.current_weather = state.weather_history.back();
+            std::cout << "[SYSTEM] Resumed Weather: " << state.current_weather << std::endl;
         }
     }
     
@@ -3489,7 +4124,7 @@ int main(int argc, char* argv[]) {
     // GENERATION LOOP
     int blocks_since_summary = 0;
     std::string last_summary_txid = "";
-    std::string current_summary_text = "The protagonist exists in a void.";
+    std::string current_summary_text = "I exist in a void.";
     
     // [UPDATED] Persistent Genesis TXID (Inheritance)
     std::string root_genesis_txid = "GENESIS";
@@ -3609,6 +4244,8 @@ int main(int argc, char* argv[]) {
         std::string failure_reason = "None";
         int attempts = 0;
         bool panic_shunt = false;
+        bool used_fimbulvetr = false;
+        bool used_dolphin_observer = false;
 
         // [USER INJECTION] First Block Only
         if (b == 0 && !user_init_prompt.empty()) {
@@ -3627,6 +4264,16 @@ int main(int argc, char* argv[]) {
                 directive,
                 synapse_data.prediction // <-- Mamba's Prediction
             );
+
+            if (!huge_content.empty() && is_contaminated(huge_content)) {
+                std::cout << " [FILTER] Composite output contaminated. Retrying with stricter constraints." << std::endl;
+                            if (state.recent_mistakes.size() > 5) state.recent_mistakes.erase(state.recent_mistakes.begin());
+            state.recent_mistakes.push_back("CONTAMINATION: " + huge_content.substr(0, 500) + "...");
+
+                directive = "CORRECTION: OUTPUT CONTAINED META/ASSISTANT TEXT. NO QUESTIONS. NO PROMPTS. PURE FIRST-PERSON.";
+                reflex_attempts++;
+                continue;
+            }
             
             // [JUDGE] DeBERTa NLI Logic Check (User Request)
             if (state.deberta) {
@@ -3635,24 +4282,85 @@ int main(int argc, char* argv[]) {
                 float nonsense_score = state.deberta->check_contradiction(current_summary_text, huge_content);
                 if (nonsense_score > 0.90f) {
                     std::cout << " [JUDGE] REJECTED (Score: " << nonsense_score << "). MISTAKE LOGGED." << std::endl;
-                    state.recent_mistakes.push_back(huge_content.substr(0, 100) + "..."); // Log fragment
+                    if (state.recent_mistakes.size() > 5) state.recent_mistakes.erase(state.recent_mistakes.begin());
+                    state.recent_mistakes.push_back(huge_content.substr(0, 500) + "...");
+ // Log fragment
                     directive = "CORRECTION: PREVIOUS BLOCK WAS ABSURD/CONTRADICTORY. BE GROUNDED.";
                     reflex_attempts++;
                     continue; // Retry
                 }
             }
 
+            bool dialogue = has_dialogue(huge_content);
+            bool pov_break = has_pov_break(huge_content);
+            bool quest_mode = has_quest_mode(state, huge_content);
+            bool internal_repeat = has_internal_repetition(huge_content);
+            bool meta_leak = has_meta_artifacts(huge_content);
+            bool too_short = huge_content.length() < 120;
+            bool history_repeat = is_repetitive(huge_content, full_context);
+            std::string deduped = dedupe_sentences(huge_content);
+            bool deduped_changed = deduped.length() + 20 < huge_content.length(); // removed at least one duplicate sentence
+            auto sentence_list = split_sentences(deduped);
+            float novelty_score = compute_novelty(state, sentence_list);
+
+            if (dialogue || pov_break || quest_mode || internal_repeat || meta_leak || too_short || history_repeat || deduped_changed || novelty_score < 0.25f) {
+                std::cout << " [FILTER] Narrative violation:";
+                if (dialogue) std::cout << " Dialogue";
+                if (pov_break) std::cout << " POV_BREAK";
+                if (quest_mode) std::cout << " QUEST_MODE";
+                if (internal_repeat) std::cout << " INTERNAL_REPEAT";
+                if (meta_leak) std::cout << " META_LEAK";
+                if (too_short) std::cout << " TOO_SHORT";
+                if (history_repeat) std::cout << " HISTORY_REPEAT";
+                if (deduped_changed) std::cout << " DEDUPED";
+                if (novelty_score < 0.25f) std::cout << " LOW_NOVELTY";
+                std::cout << std::endl;
+                huge_content = deduped; // keep deduped version for repair attempts
+
+                std::string repaired = fimbulvetr_first_person(state, huge_content);
+                if (!repaired.empty() && !has_dialogue(repaired) && !has_pov_break(repaired) && !has_quest_mode(state, repaired) && !has_internal_repetition(repaired) && !has_meta_artifacts(repaired) && repaired.length() >= 120 && !is_contaminated(repaired)) {
+                    std::cout << " [FIMBULVETR] Observer rewrite applied." << std::endl;
+                    huge_content = repaired;
+                    used_fimbulvetr = true;
+                } else {
+                    std::string dolphin_view = dolphin_observer_reframe(state, huge_content);
+                    if (!dolphin_view.empty() && !has_dialogue(dolphin_view) && !has_pov_break(dolphin_view) && !has_quest_mode(state, dolphin_view) && !has_internal_repetition(dolphin_view) && !has_meta_artifacts(dolphin_view) && dolphin_view.length() >= 120 && !is_contaminated(dolphin_view)) {
+                        std::cout << " [DOLPHIN] Observer rewrite applied." << std::endl;
+                        huge_content = dolphin_view;
+                        used_dolphin_observer = true;
+                    } else {
+                        std::string novelty_dir = novelty_directive(novelty_score);
+                        directive = "CORRECTION: FIRST PERSON ONLY. NO DIALOGUE OR QUESTS. REMOVE META TOKENS. OUTPUT 5-7 SENTENCES.";
+                        if (!novelty_dir.empty()) directive += " " + novelty_dir;
+                        // Force domain contrast on low novelty
+                        SemanticDomain detected = detect_semantic_domain(state, huge_content);
+                        state.domain_index = (int)get_contrast_domain(detected);
+                        std::cout << " [STATE] Forced contrast domain due to low novelty: " << get_domain_name(static_cast<SemanticDomain>(state.domain_index)) << std::endl;
+                        reflex_attempts++;
+                        continue;
+                    }
+                }
+            }
+
+            // Force experiential pass even if no explicit violation slipped through.
+            if (!used_fimbulvetr && !used_dolphin_observer) {
+                std::string experiential = fimbulvetr_first_person(state, huge_content);
+                if (!experiential.empty() && !has_dialogue(experiential) && !has_pov_break(experiential) && !has_quest_mode(state, experiential) && !has_internal_repetition(experiential) && !has_meta_artifacts(experiential) && experiential.length() >= 120 && !is_contaminated(experiential)) {
+                    std::cout << " [FIMBULVETR] Experiential overlay applied." << std::endl;
+                    huge_content = experiential;
+                    used_fimbulvetr = true;
+                }
+            }
+
             // CODEBERT CHECK
             if (state.sensor) {
-                std::vector<float> current_vec = state.sensor->embed(huge_content);
+                Embedding current_vec = state.sensor->embed(huge_content);
                 float max_sim = 0.0f;
                 // Check recent history (last 5 blocks) for immediate loop
-                int count = 0;
-                for (auto it = state.history_embeddings.rbegin(); it != state.history_embeddings.rend(); ++it) {
-                    if (count++ > 5) break; 
-                    float sim = state.sensor->cosine_similarity(current_vec, *it);
+                state.history_embeddings.for_each_recent([&](const Embedding& prior_vec, size_t) {
+                    float sim = state.sensor->cosine_similarity(current_vec, prior_vec);
                     if (sim > max_sim) max_sim = sim;
-                }
+                }, 5);
                 
                 reflex_score = max_sim; // Capture for logging
                 std::cout << " [REFLEX] Similarity: " << max_sim << std::endl;
@@ -3844,11 +4552,21 @@ int main(int argc, char* argv[]) {
         std::cout << new_content << std::endl;
         std::cout << "------------------------------------------------" << std::endl;
 
+        // Sentence memory update for novelty scoring
+        if (state.sensor) {
+            auto sentences = split_sentences(new_content);
+            for (const auto& s : sentences) {
+                state.sentence_memory.push_back(state.sensor->embed(s));
+                if (state.sentence_memory.size() > 80) {
+                    state.sentence_memory.erase(state.sentence_memory.begin());
+                }
+            }
+        }
+
         // REFLEX & HISTORY UPDATE
         if (state.sensor && !new_content.empty()) {
-            std::vector<float> vec = state.sensor->embed(new_content);
-            state.history_embeddings.push_back(vec);
-            if(state.history_embeddings.size() > 50) state.history_embeddings.erase(state.history_embeddings.begin());
+            Embedding vec = state.sensor->embed(new_content);
+            state.history_embeddings.push(vec);
             
             // [UPDATED] Update Concept Jail
             // [UPDATED] Update Concept Jail - DISABLED for Hermes Integration
@@ -3962,7 +4680,15 @@ int main(int argc, char* argv[]) {
 
         // [REBEL] Update World State
         std::cout << "[REBEL] Scanning for World State changes..." << std::endl;
-        auto rebel_updates = run_rebel_extraction(new_content);
+                auto rebel_updates = run_rebel_extraction(new_content);
+        if (rebel_updates.empty()) {
+            extract_world_state_llm(state, new_content);
+        } else {
+            for(auto const& [key, val] : rebel_updates) {
+                state.world_state[key] = val;
+            }
+        }
+
         if (!rebel_updates.empty()) {
             std::cout << "[REBEL] Extracted " << rebel_updates.size() << " new facts." << std::endl;
             for (const auto& pair : rebel_updates) {
@@ -3991,19 +4717,25 @@ int main(int argc, char* argv[]) {
         // --- DIVERGENCE CALCULATION ---
         float divergence = 0.0f;
         if (state.sensor) {
-            std::vector<float> pred_vec = state.sensor->embed(synapse_data.prediction);
-            std::vector<float> actual_vec = state.sensor->embed(new_content);
+            Embedding pred_vec = state.sensor->embed(synapse_data.prediction);
+            Embedding actual_vec = state.sensor->embed(new_content);
             divergence = 1.0f - state.sensor->cosine_similarity(pred_vec, actual_vec);
         }
+        float block_entropy = calculate_token_entropy(new_content);
+        int block_depth = chain_depth + 1;
 
         json private_data;
         private_data["pid_state"] = {
             {"temp", current_temperature},
-            {"complexity", calculate_token_entropy(new_content)} // Assuming entropy_score is this
+            {"complexity", block_entropy} // Assuming entropy_score is this
         };
         private_data["parent"] = parent_tx;
         private_data["refs"] = refs;
-        private_data["observer"] = (reflex_score > 0.91f) ? "phi-2" : "llama-3-8b";
+        std::string observer_tag = "dolphin-8b";
+        if (used_fimbulvetr) observer_tag = "fimbulvetr";
+        else if (used_dolphin_observer) observer_tag = "dolphin-8b-observer";
+        else if (reflex_score > 0.91f) observer_tag = "phi-2";
+        private_data["observer"] = observer_tag;
         private_data["directive"] = directive;
         private_data["reflex_score"] = reflex_score;
         private_data["entropy_loss"] = calculate_entropy_loss(full_context); // Full detail
@@ -4013,8 +4745,12 @@ int main(int argc, char* argv[]) {
         json public_payload;
         public_payload["genesis_txid"] = root_genesis_txid; // [FIXED] Hereditary TXID
 
+        public_payload["schema_version"] = "1.1";
         public_payload["program"] = "LOCAL_MIND_v3_DUAL_ENGINE";
-        public_payload["model"] = "Llama-3-8B-Instruct + Gemma-2-2B";
+        public_payload["engine"] = {
+            {"name", "LOCAL_MIND"},
+            {"mode", "dual_engine"}
+        };
         public_payload["neural_link"] = {
             {"prev_state_hash", synapse_data.state_hash},
             {"predicted_next", synapse_data.prediction},
@@ -4025,20 +4761,49 @@ int main(int argc, char* argv[]) {
         public_payload["timestamp"] = std::time(0);
         public_payload["commitment"] = sha256_string(private_data.dump()); // Hash of private reasoning
         public_payload["summary"] = current_summary_text; // Include latest summary
-        public_payload["depth"] = std::to_string(history.size() + 1); // Depth
-        public_payload["mistakes_rag"] = state.recent_mistakes; // [NEW] mistakes log
-        public_payload["world_state"] = state.world_state; // [REBEL] Persist World State
+        public_payload["depth"] = block_depth;
+        public_payload["mistakes_log"] = state.recent_mistakes;
+        public_payload["world_state"] = sanitize_world_state(state.world_state); // [REBEL] Persist World State
         public_payload["chronos"] = {
             {"weather", state.current_weather},
             {"pending_intervention", state.pending_chronos_msg} 
         };
+        public_payload["metrics"] = {
+            {"entropy", block_entropy},
+            {"temperature", current_temperature},
+            {"reflex_score", reflex_score}
+        };
+        // Optional novelty metric derived from embeddings
+        if (state.sensor) {
+            public_payload["metrics"]["novelty"] = compute_novelty(state, split_sentences(new_content));
+        }
+        public_payload["content_meta"] = {
+            {"chars", static_cast<int>(new_content.size())},
+            {"refs", static_cast<int>(refs.size())}
+        };
+        // Provide both raw text and a structured view for readability downstream.
         public_payload["content"] = new_content; // The Narrative Block itself
+        std::vector<std::string> content_lines;
+        {
+            std::stringstream ss(new_content);
+            std::string line;
+            std::set<std::string> seen_lines;
+            while (std::getline(ss, line)) {
+                std::string trimmed = line;
+                while (!trimmed.empty() && isspace(static_cast<unsigned char>(trimmed.front()))) trimmed.erase(trimmed.begin());
+                while (!trimmed.empty() && isspace(static_cast<unsigned char>(trimmed.back()))) trimmed.pop_back();
+                std::string lower = trimmed;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                if (!trimmed.empty() && seen_lines.insert(lower).second) content_lines.push_back(trimmed);
+            }
+        }
+        public_payload["content_lines"] = content_lines;
         public_payload["parent_tx"] = parent_tx;
         
         // Metadata for Uploader (Tags)
         // We'll write public_payload to file
         
-        std::string json_content = public_payload.dump();
+        std::string json_content = public_payload.dump(2);
         std::string payload_file = "temp_payload.json";
         std::ofstream pf(payload_file);
         pf << json_content;
@@ -4093,9 +4858,10 @@ int main(int argc, char* argv[]) {
             parent_tx = txid;
             full_context += new_content + " ";
             blocks_since_summary++;
+            chain_depth = block_depth;
             
             // [CHRONOS] METRIC TRACKING & FORECAST
-            float ent = calculate_token_entropy(new_content);
+            float ent = block_entropy;
             state.history_entropy.push_back(ent);
             state.history_sentiment.push_back(current_temperature);
             state.history_speed.push_back((float)new_content.length()); 
@@ -4105,8 +4871,11 @@ int main(int argc, char* argv[]) {
             if(state.history_speed.size() > 10) state.history_speed.erase(state.history_speed.begin());
 
             std::cout << "[CHRONOS] Sampling Weather... (Ent=" << ent << ", Temp=" << current_temperature << ")" << std::endl;
-            state.pending_chronos_msg = run_chronos_forecast(state);
-            state.current_weather = (state.pending_chronos_msg.empty()) ? "SUNNY" : "STORM";
+            std::string chrono_context = new_content;
+            if (chrono_context.length() < 400) {
+                chrono_context = full_context.substr(full_context.length() > 800 ? full_context.length() - 800 : 0) + new_content;
+            }
+            state.pending_chronos_msg = run_chronos_forecast(state, chrono_context);
 
             std::ofstream out("last_tx.txt");
             out << txid;
@@ -4135,6 +4904,9 @@ int main(int argc, char* argv[]) {
     if (state.ctx_qwen_creative) llama_free(state.ctx_qwen_creative);
     if (state.model_qwen_creative) llama_model_free(state.model_qwen_creative);
 
+    if (state.ctx_fimbulvetr) llama_free(state.ctx_fimbulvetr);
+    if (state.model_fimbulvetr) llama_model_free(state.model_fimbulvetr);
+
     if (state.ctx_phi) llama_free(state.ctx_phi);
     if (state.model_phi) llama_model_free(state.model_phi);
 
@@ -4150,6 +4922,12 @@ int main(int argc, char* argv[]) {
     if (state.model_rwkv) llama_model_free(state.model_rwkv);
     if (state.ctx_mamba) llama_free(state.ctx_mamba);
     if (state.model_mamba) llama_model_free(state.model_mamba);
+    if (state.ctx_hermes) llama_free(state.ctx_hermes);
+    if (state.model_hermes) llama_model_free(state.model_hermes);
+    if (state.ctx_saul) llama_free(state.ctx_saul);
+    if (state.model_saul) llama_model_free(state.model_saul);
+    if (state.ctx_logic) llama_free(state.ctx_logic);
+    if (state.model_logic) llama_model_free(state.model_logic);
 
     llama_backend_free();
     return 0;
